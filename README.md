@@ -208,6 +208,10 @@ Calibration:
 - `CALIBRATION_ENABLED` (default `true`)
 - `CALIBRATION_FILE` (optional; if set, calibration survives restarts)
 
+System prompt manipulation:
+
+- `STRIP_SYSTEM_PROMPT_TEXT` (optional; text to remove from system prompts)
+
 Example:
 
 ```bash
@@ -220,6 +224,80 @@ DYNAMIC_DEFAULT_OUTPUT_BUDGET=true \
 CALIBRATION_FILE=./data/calibration.json \
 ./ollama-auto-ctx
 ```
+
+---
+
+## Thinking Mode Support
+
+Some models support a "thinking" or "reasoning" mode that can be controlled via a parameter.
+
+The proxy supports this via **system prompt directives**:
+
+Add `__think=<verdict>` anywhere in your system prompt (typically at the end):
+
+```json
+{
+  "model": "gpt-oss:20b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant. __think=high"
+    },
+    {
+      "role": "user",
+      "content": "Explain quantum computing"
+    }
+  ]
+}
+```
+
+The proxy will:
+1. Detect and extract `__think=high` from the system prompt
+2. Remove it from the prompt (so Ollama doesn't see it)
+3. Inject `"think": "high"` at the top level of the request
+4. Forward the cleaned request to Ollama
+
+**Result sent to Ollama:**
+```json
+{
+  "model": "gpt-oss:20b",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Explain quantum computing"
+    }
+  ],
+  "think": "high",
+  "options": {
+    "num_ctx": 8192
+  }
+}
+```
+
+### Supported Models
+
+- **qwen3**: Boolean thinking mode
+  - `__think=true` or `__think=false`
+- **deepseek**: Boolean thinking mode
+  - `__think=true` or `__think=false`
+- **gpt-oss**: Level-based thinking mode
+  - `__think=low`, `__think=medium`, or `__think=high`
+
+Invalid verdicts for the model family are silently ignored (fail-open behavior)
+
+### System Prompt Stripping
+
+If you need to remove proxy-specific instructions from system prompts:
+
+```bash
+STRIP_SYSTEM_PROMPT_TEXT="text to remove"
+```
+
+This can be set via environment variable or the `--strip-system-prompt` flag.
 
 ---
 

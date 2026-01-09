@@ -3,6 +3,7 @@ package estimate
 import (
 	"encoding/json"
 	"math"
+	"strings"
 
 	"ollama-auto-ctx/internal/calibration"
 	"ollama-auto-ctx/internal/util"
@@ -33,6 +34,123 @@ type Features struct {
 	ProvidedNumCtxOK bool
 	NumPredict       int
 	NumPredictOK     bool
+}
+
+// extractThinkingFromText looks for __think=<verdict> in text and returns the verdict and cleaned text.
+func extractThinkingFromText(text string) (verdict string, cleanedText string) {
+	// Look for __think=<verdict> pattern
+	idx := strings.Index(text, "__think=")
+	if idx == -1 {
+		return "", text
+	}
+
+	// Extract everything after __think=
+	afterThink := text[idx+8:] // 8 = len("__think=")
+
+	// Find the end of the verdict (space, newline, or end of string)
+	endIdx := len(afterThink)
+	for i, ch := range afterThink {
+		if ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
+			endIdx = i
+			break
+		}
+	}
+
+	verdict = afterThink[:endIdx]
+
+	// Remove __think=<verdict> from the text
+	cleanedText = text[:idx] + afterThink[endIdx:]
+
+	// Clean up extra whitespace
+	cleanedText = strings.TrimSpace(cleanedText)
+	// Normalize multiple newlines
+	for strings.Contains(cleanedText, "\n\n\n") {
+		cleanedText = strings.ReplaceAll(cleanedText, "\n\n\n", "\n\n")
+	}
+
+	return verdict, cleanedText
+}
+
+// ExtractThinkingFromSystemPrompt extracts __think=<verdict> from system prompts.
+// Returns the extracted verdict (empty if none found) and modifies reqMap to remove the directive.
+func ExtractThinkingFromSystemPrompt(reqMap map[string]any, endpoint string) string {
+	var extractedVerdict string
+
+	switch endpoint {
+	case EndpointGenerate:
+		// Extract from "system" field
+		if system, ok := util.ToString(reqMap["system"]); ok {
+			verdict, cleaned := extractThinkingFromText(system)
+			if verdict != "" {
+				extractedVerdict = verdict
+				reqMap["system"] = cleaned
+			}
+		}
+
+	case EndpointChat:
+		// Extract from messages with role=system
+		if msgs, ok := reqMap["messages"].([]any); ok {
+			for _, m := range msgs {
+				mm, ok := m.(map[string]any)
+				if !ok {
+					continue
+				}
+				if role, ok := util.ToString(mm["role"]); ok && role == "system" {
+					if content, ok := util.ToString(mm["content"]); ok {
+						verdict, cleaned := extractThinkingFromText(content)
+						if verdict != "" {
+							extractedVerdict = verdict
+							mm["content"] = cleaned
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return extractedVerdict
+}
+
+// StripSystemPromptText removes specified text from system prompts.
+// It handles both /api/generate (system field) and /api/chat (messages with role=system).
+func StripSystemPromptText(reqMap map[string]any, endpoint, textToStrip string) {
+	if textToStrip == "" {
+		return
+	}
+
+	switch endpoint {
+	case EndpointGenerate:
+		// Strip from "system" field
+		if system, ok := util.ToString(reqMap["system"]); ok {
+			cleaned := strings.ReplaceAll(system, textToStrip, "")
+			// Clean up extra whitespace
+			cleaned = strings.TrimSpace(cleaned)
+			// Normalize multiple newlines to single newline
+			cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
+			reqMap["system"] = cleaned
+		}
+
+	case EndpointChat:
+		// Strip from messages with role=system
+		if msgs, ok := reqMap["messages"].([]any); ok {
+			for _, m := range msgs {
+				mm, ok := m.(map[string]any)
+				if !ok {
+					continue
+				}
+				if role, ok := util.ToString(mm["role"]); ok && role == "system" {
+					if content, ok := util.ToString(mm["content"]); ok {
+						cleaned := strings.ReplaceAll(content, textToStrip, "")
+						// Clean up extra whitespace
+						cleaned = strings.TrimSpace(cleaned)
+						// Normalize multiple newlines to single newline
+						cleaned = strings.ReplaceAll(cleaned, "\n\n\n", "\n\n")
+						mm["content"] = cleaned
+					}
+				}
+			}
+		}
+	}
 }
 
 // ExtractFeatures computes token-relevant features from an Ollama request payload.

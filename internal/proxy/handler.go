@@ -45,6 +45,7 @@ type Decision struct {
 	MaxConfigCtx         int
 	MaxModelCtx          int
 	MaxSafeCtx           int
+	ThinkVerdict         string
 }
 
 // Handler is an http.Handler that proxies to Ollama and injects options.num_ctx
@@ -173,6 +174,14 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		return
 	}
 
+	// Extract thinking directive from system prompt (this also strips it from the prompt)
+	systemPromptThinkVerdict := estimate.ExtractThinkingFromSystemPrompt(reqMap, endpoint)
+
+	// Strip system prompt text if configured
+	if h.cfg.StripSystemPromptText != "" {
+		estimate.StripSystemPromptText(reqMap, endpoint, h.cfg.StripSystemPromptText)
+	}
+
 	features, err := estimate.ExtractFeatures(endpoint, reqMap)
 	if err != nil {
 		return
@@ -228,14 +237,49 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 	// Decide final context window based on override policy and any user-provided value.
 	finalCtx, override, clamped := chooseFinalCtx(desiredCtx, effMax, features.ProvidedNumCtx, features.ProvidedNumCtxOK, h.cfg.OverrideNumCtx)
 
-	// If we need to inject/adjust options.num_ctx, do it.
-	if override || clamped {
-		opt, ok := reqMap["options"].(map[string]any)
-		if !ok || opt == nil {
-			opt = make(map[string]any)
+	// Validate system prompt thinking verdict against model family
+	finalThinkVerdict := ""
+	if systemPromptThinkVerdict != "" {
+		modelLower := strings.ToLower(features.Model)
+		if strings.HasPrefix(modelLower, "qwen3") || strings.HasPrefix(modelLower, "deepseek") {
+			// Boolean type: only accept "true" or "false"
+			if systemPromptThinkVerdict == "true" || systemPromptThinkVerdict == "false" {
+				finalThinkVerdict = systemPromptThinkVerdict
+			}
+		} else if strings.HasPrefix(modelLower, "gpt-oss") {
+			// Level type: only accept "low", "medium", or "high"
+			if systemPromptThinkVerdict == "low" || systemPromptThinkVerdict == "medium" || systemPromptThinkVerdict == "high" {
+				finalThinkVerdict = systemPromptThinkVerdict
+			}
 		}
-		opt["num_ctx"] = finalCtx
-		reqMap["options"] = opt
+	}
+
+	// Prepare to modify request body if needed
+	needsRewrite := override || clamped || finalThinkVerdict != ""
+
+	// If we need to inject/adjust options.num_ctx or thinking mode, do it.
+	if needsRewrite {
+		// Inject num_ctx if needed
+		if override || clamped {
+			opt, ok := reqMap["options"].(map[string]any)
+			if !ok || opt == nil {
+				opt = make(map[string]any)
+			}
+			opt["num_ctx"] = finalCtx
+			reqMap["options"] = opt
+		}
+
+		// Inject thinking option at top level if we have a verdict
+		if finalThinkVerdict != "" {
+			modelLower := strings.ToLower(features.Model)
+			if strings.HasPrefix(modelLower, "qwen3") || strings.HasPrefix(modelLower, "deepseek") {
+				// Boolean type: convert string to bool
+				reqMap["think"] = (finalThinkVerdict == "true")
+			} else if strings.HasPrefix(modelLower, "gpt-oss") {
+				// Level type: pass string directly
+				reqMap["think"] = finalThinkVerdict
+			}
+		}
 
 		newBody, err := util.EncodeJSON(reqMap)
 		if err != nil {
@@ -271,6 +315,7 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		MaxConfigCtx:          h.cfg.MaxCtx,
 		MaxModelCtx:           maxModelCtx,
 		MaxSafeCtx:            maxSafe,
+		ThinkVerdict:          finalThinkVerdict,
 	}
 
 	ctx2 := context.WithValue(r.Context(), ctxSampleKey, sample)
@@ -297,6 +342,7 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		"clamped", dec.Clamped,
 		"max_model_ctx", dec.MaxModelCtx,
 		"max_safe_ctx", dec.MaxSafeCtx,
+		"think_verdict", dec.ThinkVerdict,
 	)
 }
 

@@ -72,6 +72,9 @@ type Config struct {
 
 	// Logging
 	LogLevel string
+
+	// System prompt manipulation
+	StripSystemPromptText string
 }
 
 // Load parses flags/env and returns a validated Config.
@@ -114,6 +117,8 @@ func Load() (Config, error) {
 		FlushInterval:   getEnvDuration("FLUSH_INTERVAL", 100*time.Millisecond),
 
 		LogLevel: getEnvString("LOG_LEVEL", "info"),
+
+		StripSystemPromptText: getEnvString("STRIP_SYSTEM_PROMPT_TEXT", ""),
 	}
 
 	// Flags (override env).
@@ -139,6 +144,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.CORSAllowOrigin, "cors-origin", cfg.CORSAllowOrigin, "CORS allow origin header value (env CORS_ALLOW_ORIGIN)")
 	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "flush interval for streaming proxy (env FLUSH_INTERVAL)")
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug|info|warn|error (env LOG_LEVEL)")
+	flag.StringVar(&cfg.StripSystemPromptText, "strip-system-prompt", cfg.StripSystemPromptText, "text to remove from system prompts (env STRIP_SYSTEM_PROMPT_TEXT)")
 
 	flag.Parse()
 

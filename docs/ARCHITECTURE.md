@@ -61,9 +61,57 @@ num_ctx  = smallest bucket >= needed_headroom
 num_ctx  = clamp(num_ctx, MIN_CTX, min(MAX_CTX, model_max_ctx, safe_max_ctx))
 ```
 
-### Why this “heuristic + calibration” approach?
+### Why this "heuristic + calibration" approach?
 
-Exact tokenization is model- and template-dependent. Instead of shipping tokenizers and trying to replicate Ollama’s internal prompt rendering, the proxy uses a cheap approximation that becomes accurate over time by learning from `prompt_eval_count`.
+Exact tokenization is model- and template-dependent. Instead of shipping tokenizers and trying to replicate Ollama's internal prompt rendering, the proxy uses a cheap approximation that becomes accurate over time by learning from `prompt_eval_count`.
+
+---
+
+## Thinking Mode Support
+
+The proxy supports model-specific thinking modes via `__think=<verdict>` directives in system prompts.
+
+### Detection Method
+
+**System Prompt Directive**
+- Detects `__think=<verdict>` anywhere in system prompts
+- Automatically strips it from the prompt before sending to Ollama
+- Works for both `/api/generate` (system field) and `/api/chat` (system role messages)
+
+### Supported Model Families
+
+- qwen3, deepseek: boolean (true/false) → `think` = bool
+- gpt-oss: level (low/medium/high) → `think` = string
+
+### Flow Example
+
+1. Client sends request:
+```json
+{
+  "model": "gpt-oss:20b",
+  "messages": [
+    {"role": "system", "content": "You are helpful. __think=high"}
+  ]
+}
+```
+
+2. Proxy extracts `__think=high` from system prompt
+3. Proxy validates `high` is valid for gpt-oss family
+4. Proxy removes `__think=high` from the system message content
+5. Proxy injects `"think": "high"` at top level of request
+6. Proxy forwards cleaned request to Ollama
+
+Result:
+```json
+{
+  "model": "gpt-oss:20b",
+  "messages": [{"role": "system", "content": "You are helpful."}],
+  "think": "high",
+  "options": {"num_ctx": 8192}
+}
+```
+
+Invalid verdicts or unsupported model families are silently ignored (fail-open).
 
 ---
 
