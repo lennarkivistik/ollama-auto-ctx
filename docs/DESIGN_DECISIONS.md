@@ -79,13 +79,16 @@ Design favors "don't become a strict gateway":
 
 ---
 
-## 9) All supervisor features are opt-in and fail-open
+## 9) Supervisor features: monitoring auto-enabled, protection opt-in, all fail-open
 
-Supervisor features (watchdog, loop detection, retry, restart) add complexity and behavioral changes.
+**Decision:**
+- **Monitoring features** (tracking, observability, metrics, health checks) are auto-enabled when `SUPERVISOR_ENABLED=true`
+- **Protection features** (watchdog, loop detection, retry, restart, output limits) remain explicitly opt-in
+- All supervisor features fail-open: internal errors never block or break the request path
 
-**Decision:** All features are disabled by default. When enabled, they fail-open: internal errors never block or break the request path.
+**Why monitoring auto-enabled:** Basic monitoring is essential for understanding proxy behavior and doesn't change request handling. Low overhead, high value.
 
-**Why opt-in:** Safety timeouts and loop detection are significant behavioral changes. Users must explicitly enable them after testing.
+**Why protection opt-in:** Safety timeouts, loop detection, and restarts are significant behavioral changes. Users must explicitly enable them after testing.
 
 **Why fail-open:** The proxy's primary job is forwarding requests. Supervisor failures should never become a new source of request failures.
 

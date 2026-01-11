@@ -132,9 +132,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	var outputTokenLimit int64
 	var outputLimitAction string
 	var minOutputBytes int64
-	if h.cfg.SupervisorOutputLimitEnabled && h.cfg.SupervisorOutputLimitTokens > 0 {
-		outputTokenLimit = int64(h.cfg.SupervisorOutputLimitTokens)
-		outputLimitAction = h.cfg.SupervisorOutputLimitAction
+	if h.cfg.SupervisorOutputSafetyLimitEnabled && h.cfg.SupervisorOutputSafetyLimitTokens > 0 {
+		outputTokenLimit = int64(h.cfg.SupervisorOutputSafetyLimitTokens)
+		outputLimitAction = h.cfg.SupervisorOutputSafetyLimitAction
 		// Use same minimum as loop detection for consistency
 		minOutputBytes = int64(h.cfg.SupervisorLoopMinOutputBytes)
 		if minOutputBytes < 256 {
@@ -206,6 +206,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/healthz/upstream" {
 		h.handleHealthzUpstream(w, r)
+		return
+	}
+
+	// Dashboard endpoint
+	if r.URL.Path == "/dashboard" && r.Method == http.MethodGet {
+		h.handleDashboard(w, r)
 		return
 	}
 
@@ -726,4 +732,11 @@ func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) 
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleDashboard serves the monitoring dashboard HTML page.
+func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(dashboardHTML))
 }

@@ -124,10 +124,10 @@ type Config struct {
 	SupervisorHealthCheckInterval time.Duration
 	SupervisorHealthCheckTimeout  time.Duration
 
-	// Supervisor / output token limiting (disabled by default)
-	SupervisorOutputLimitEnabled  bool
-	SupervisorOutputLimitTokens   int64
-	SupervisorOutputLimitAction   string // "cancel" or "warn"
+	// Supervisor / output safety limiting (disabled by default)
+	SupervisorOutputSafetyLimitEnabled  bool
+	SupervisorOutputSafetyLimitTokens   int64
+	SupervisorOutputSafetyLimitAction   string // "cancel" or "warn"
 }
 
 // Load parses flags/env and returns a validated Config.
@@ -213,9 +213,9 @@ func Load() (Config, error) {
 		SupervisorHealthCheckInterval: getEnvDuration("SUPERVISOR_HEALTH_CHECK_INTERVAL", 30*time.Second),
 		SupervisorHealthCheckTimeout:  getEnvDuration("SUPERVISOR_HEALTH_CHECK_TIMEOUT", 5*time.Second),
 
-		SupervisorOutputLimitEnabled: getEnvBool("SUPERVISOR_OUTPUT_LIMIT_ENABLED", false),
-		SupervisorOutputLimitTokens:  getEnvInt64("SUPERVISOR_OUTPUT_LIMIT_TOKENS", 0),
-		SupervisorOutputLimitAction:   getEnvString("SUPERVISOR_OUTPUT_LIMIT_ACTION", "cancel"),
+		SupervisorOutputSafetyLimitEnabled: getEnvBool("SUPERVISOR_OUTPUT_SAFETY_LIMIT_ENABLED", false),
+		SupervisorOutputSafetyLimitTokens:  getEnvInt64("SUPERVISOR_OUTPUT_SAFETY_LIMIT_TOKENS", 0),
+		SupervisorOutputSafetyLimitAction:   getEnvString("SUPERVISOR_OUTPUT_SAFETY_LIMIT_ACTION", "cancel"),
 	}
 
 	// Flags (override env).
@@ -274,9 +274,9 @@ func Load() (Config, error) {
 	flag.BoolVar(&cfg.SupervisorHealthCheckEnabled, "supervisor-health-check-enabled", cfg.SupervisorHealthCheckEnabled, "enable upstream health checking (env SUPERVISOR_HEALTH_CHECK_ENABLED)")
 	flag.DurationVar(&cfg.SupervisorHealthCheckInterval, "supervisor-health-check-interval", cfg.SupervisorHealthCheckInterval, "health check interval (env SUPERVISOR_HEALTH_CHECK_INTERVAL)")
 	flag.DurationVar(&cfg.SupervisorHealthCheckTimeout, "supervisor-health-check-timeout", cfg.SupervisorHealthCheckTimeout, "health check timeout (env SUPERVISOR_HEALTH_CHECK_TIMEOUT)")
-	flag.BoolVar(&cfg.SupervisorOutputLimitEnabled, "supervisor-output-limit-enabled", cfg.SupervisorOutputLimitEnabled, "enable output token limiting (env SUPERVISOR_OUTPUT_LIMIT_ENABLED)")
-	flag.Int64Var(&cfg.SupervisorOutputLimitTokens, "supervisor-output-limit-tokens", cfg.SupervisorOutputLimitTokens, "maximum output tokens (0 = disabled) (env SUPERVISOR_OUTPUT_LIMIT_TOKENS)")
-	flag.StringVar(&cfg.SupervisorOutputLimitAction, "supervisor-output-limit-action", cfg.SupervisorOutputLimitAction, "action when limit exceeded: cancel or warn (env SUPERVISOR_OUTPUT_LIMIT_ACTION)")
+		flag.BoolVar(&cfg.SupervisorOutputSafetyLimitEnabled, "supervisor-output-safety-limit-enabled", cfg.SupervisorOutputSafetyLimitEnabled, "enable output safety limiting (env SUPERVISOR_OUTPUT_SAFETY_LIMIT_ENABLED)")
+		flag.Int64Var(&cfg.SupervisorOutputSafetyLimitTokens, "supervisor-output-safety-limit-tokens", cfg.SupervisorOutputSafetyLimitTokens, "maximum output tokens before safety limit (0 = disabled) (env SUPERVISOR_OUTPUT_SAFETY_LIMIT_TOKENS)")
+		flag.StringVar(&cfg.SupervisorOutputSafetyLimitAction, "supervisor-output-safety-limit-action", cfg.SupervisorOutputSafetyLimitAction, "action when safety limit exceeded: cancel or warn (env SUPERVISOR_OUTPUT_SAFETY_LIMIT_ACTION)")
 
 	flag.Parse()
 
@@ -288,6 +288,30 @@ func Load() (Config, error) {
 		}
 		if len(parsed) > 0 {
 			cfg.Buckets = parsed
+		}
+	}
+
+	// Auto-enable supervisor monitoring features when SUPERVISOR_ENABLED=true
+	// Only apply if the user hasn't explicitly set these environment variables
+	if cfg.SupervisorEnabled {
+		// Auto-enable request tracking (required for most supervisor features)
+		if _, trackSet := os.LookupEnv("SUPERVISOR_TRACK_REQUESTS"); !trackSet {
+			cfg.SupervisorTrackRequests = true
+		}
+
+		// Auto-enable observability (for monitoring and dashboard)
+		if _, obsSet := os.LookupEnv("SUPERVISOR_OBS_ENABLED"); !obsSet {
+			cfg.SupervisorObsEnabled = true
+		}
+
+		// Auto-enable metrics (Prometheus endpoint)
+		if _, metricsSet := os.LookupEnv("SUPERVISOR_METRICS_ENABLED"); !metricsSet {
+			cfg.SupervisorMetricsEnabled = true
+		}
+
+		// Auto-enable health checking (used by dashboard and monitoring)
+		if _, healthSet := os.LookupEnv("SUPERVISOR_HEALTH_CHECK_ENABLED"); !healthSet {
+			cfg.SupervisorHealthCheckEnabled = true
 		}
 	}
 
@@ -373,11 +397,11 @@ func (c Config) Validate() error {
 	if c.SupervisorHealthCheckTimeout <= 0 {
 		return fmt.Errorf("SUPERVISOR_HEALTH_CHECK_TIMEOUT must be > 0")
 	}
-	if c.SupervisorOutputLimitTokens < 0 {
-		return fmt.Errorf("SUPERVISOR_OUTPUT_LIMIT_TOKENS must be >= 0")
+	if c.SupervisorOutputSafetyLimitTokens < 0 {
+		return fmt.Errorf("SUPERVISOR_OUTPUT_SAFETY_LIMIT_TOKENS must be >= 0")
 	}
-	if c.SupervisorOutputLimitAction != "cancel" && c.SupervisorOutputLimitAction != "warn" {
-		return fmt.Errorf("SUPERVISOR_OUTPUT_LIMIT_ACTION must be 'cancel' or 'warn'")
+	if c.SupervisorOutputSafetyLimitAction != "cancel" && c.SupervisorOutputSafetyLimitAction != "warn" {
+		return fmt.Errorf("SUPERVISOR_OUTPUT_SAFETY_LIMIT_ACTION must be 'cancel' or 'warn'")
 	}
 	switch c.OverrideNumCtx {
 	case OverrideAlways, OverrideIfMissing, OverrideIfTooSmall:

@@ -214,8 +214,8 @@ func logConfig(logger *slog.Logger, cfg config.Config) {
 		"supervisor_health_check_enabled", cfg.SupervisorHealthCheckEnabled,
 		"supervisor_health_check_interval", cfg.SupervisorHealthCheckInterval,
 		"supervisor_health_check_timeout", cfg.SupervisorHealthCheckTimeout,
-		"supervisor_output_limit_enabled", cfg.SupervisorOutputLimitEnabled,
-		"supervisor_output_limit_tokens", cfg.SupervisorOutputLimitTokens,
-		"supervisor_output_limit_action", cfg.SupervisorOutputLimitAction,
+		"supervisor_output_safety_limit_enabled", cfg.SupervisorOutputSafetyLimitEnabled,
+		"supervisor_output_safety_limit_tokens", cfg.SupervisorOutputSafetyLimitTokens,
+		"supervisor_output_safety_limit_action", cfg.SupervisorOutputSafetyLimitAction,
 	)
 }

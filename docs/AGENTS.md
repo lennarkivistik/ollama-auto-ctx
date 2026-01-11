@@ -117,17 +117,22 @@ internal/supervisor/*_test.go           # Supervisor components
 
 ## Configuration Summary
 
-All supervisor features require:
+Enable the supervisor layer:
 ```bash
 SUPERVISOR_ENABLED=true
-SUPERVISOR_TRACK_REQUESTS=true
 ```
 
-Then enable specific features:
+When `SUPERVISOR_ENABLED=true`, these monitoring features are **automatically enabled**:
+- `SUPERVISOR_TRACK_REQUESTS=true` - Request lifecycle tracking
+- `SUPERVISOR_OBS_ENABLED=true` - Observability endpoints
+- `SUPERVISOR_METRICS_ENABLED=true` - Prometheus metrics
+- `SUPERVISOR_HEALTH_CHECK_ENABLED=true` - Health monitoring
+
+Then enable protection features as needed:
 - Watchdog: `SUPERVISOR_WATCHDOG_ENABLED=true`
 - Loop detection: `SUPERVISOR_LOOP_DETECT_ENABLED=true`
 - Retry: `SUPERVISOR_RETRY_ENABLED=true`
 - Restart: `SUPERVISOR_RESTART_ENABLED=true` + `SUPERVISOR_RESTART_CMD=...`
-- Observability: `SUPERVISOR_OBS_ENABLED=true`
+- Output safety limiting: `SUPERVISOR_OUTPUT_SAFETY_LIMIT_ENABLED=true`
 
 See README.md for complete configuration reference.

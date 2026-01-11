@@ -117,8 +117,15 @@ All supervisor features are **opt-in** and **disabled by default**. Enable the s
 
 ```bash
 SUPERVISOR_ENABLED=true
-SUPERVISOR_TRACK_REQUESTS=true  # Required for most features
 ```
+
+When `SUPERVISOR_ENABLED=true`, these monitoring features are **automatically enabled**:
+- `SUPERVISOR_TRACK_REQUESTS=true` - Request lifecycle tracking
+- `SUPERVISOR_OBS_ENABLED=true` - Observability endpoints (`/debug/requests`, `/events`)
+- `SUPERVISOR_METRICS_ENABLED=true` - Prometheus metrics (`/metrics`)
+- `SUPERVISOR_HEALTH_CHECK_ENABLED=true` - Upstream health monitoring
+
+You can explicitly disable any of these by setting them to `false` if needed.
 
 ### Watchdog Timeouts
 
@@ -192,11 +199,11 @@ SUPERVISOR_RESTART_CMD="pkill ollama && sleep 2 && ollama serve &"
 
 ### Observability Endpoints
 
-Real-time monitoring for GUIs and dashboards.
+Real-time monitoring for GUIs and dashboards. **Auto-enabled when `SUPERVISOR_ENABLED=true`**.
 
 | Variable | Flag | Default | Description |
 |----------|------|---------|-------------|
-| `SUPERVISOR_OBS_ENABLED` | `--supervisor-obs-enabled` | `false` | Enable observability |
+| `SUPERVISOR_OBS_ENABLED` | `--supervisor-obs-enabled` | `false` (auto-enabled) | Enable observability |
 | `SUPERVISOR_OBS_REQUESTS_ENDPOINT` | `--supervisor-obs-requests` | `true` | Enable `/debug/requests` |
 | `SUPERVISOR_OBS_SSE_ENDPOINT` | `--supervisor-obs-sse` | `true` | Enable `/events` SSE |
 | `SUPERVISOR_OBS_PROGRESS_INTERVAL` | `--supervisor-obs-progress-interval` | `250ms` | Progress event throttling |
@@ -228,33 +235,32 @@ curl -N http://localhost:11435/events
 
 ```bash
 SUPERVISOR_ENABLED=true \
-SUPERVISOR_TRACK_REQUESTS=true \
 SUPERVISOR_WATCHDOG_ENABLED=true \
 SUPERVISOR_TTFB_TIMEOUT=60s \
 SUPERVISOR_STALL_TIMEOUT=30s \
 SUPERVISOR_HARD_TIMEOUT=10m \
-SUPERVISOR_OBS_ENABLED=true \
 CALIBRATION_FILE=/var/lib/ollama-auto-ctx/calibration.json \
 ./ollama-auto-ctx
 ```
+
+**Note:** `SUPERVISOR_TRACK_REQUESTS`, `SUPERVISOR_OBS_ENABLED`, `SUPERVISOR_METRICS_ENABLED`, and `SUPERVISOR_HEALTH_CHECK_ENABLED` are automatically enabled.
 
 ### Aggressive protection
 
 ```bash
 SUPERVISOR_ENABLED=true \
-SUPERVISOR_TRACK_REQUESTS=true \
 SUPERVISOR_WATCHDOG_ENABLED=true \
 SUPERVISOR_TTFB_TIMEOUT=30s \
 SUPERVISOR_LOOP_DETECT_ENABLED=true \
-SUPERVISOR_OUTPUT_LIMIT_ENABLED=true \
-SUPERVISOR_OUTPUT_LIMIT_TOKENS=10000 \
+SUPERVISOR_OUTPUT_SAFETY_LIMIT_ENABLED=true \
+SUPERVISOR_OUTPUT_SAFETY_LIMIT_TOKENS=10000 \
 SUPERVISOR_RETRY_ENABLED=true \
 SUPERVISOR_RESTART_ENABLED=true \
 SUPERVISOR_RESTART_CMD="systemctl restart ollama" \
-SUPERVISOR_HEALTH_CHECK_ENABLED=true \
-SUPERVISOR_METRICS_ENABLED=true \
 ./ollama-auto-ctx
 ```
+
+**Note:** `SUPERVISOR_TRACK_REQUESTS`, `SUPERVISOR_OBS_ENABLED`, `SUPERVISOR_METRICS_ENABLED`, and `SUPERVISOR_HEALTH_CHECK_ENABLED` are automatically enabled.
 
 ---
 
