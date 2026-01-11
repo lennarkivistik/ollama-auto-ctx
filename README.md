@@ -1,80 +1,50 @@
-**ollama-auto-ctx** is a small Go reverse proxy that sits in front of Ollama and automatically injects an appropriate `options.num_ctx` for each request.
+# Ollama AutoCTX
 
-It targets a very specific pain: **silent prompt truncation** caused by low default context windows, especially once you add a system prompt, tools, and chat history.
-
----
-
-## What it does
-
-- **Acts as a 1:1 reverse proxy** for the Ollama HTTP API (future‑proof pass‑through).
-- **Intercepts only**:
-  - `POST /api/chat`
-  - `POST /api/generate`
-- **Estimates required context** and injects/adjusts `options.num_ctx` based on:
-  - prompt size (system + messages + tools)
-  - expected output budget (`options.num_predict`, if present)
-  - a configurable headroom multiplier
-  - **bucket selection** (small prompts stay fast)
-  - the model’s max context from `POST /api/show`
-- **Preserves streaming**: Ollama streams newline‑delimited JSON (NDJSON); the proxy forwards bytes immediately.
-- **Auto‑calibrates over time** by reading Ollama’s `prompt_eval_count` and improving its estimation parameters per model.
+A smart reverse proxy for Ollama that automatically manages context windows, prevents runaway requests, and provides real-time observability.
 
 ---
 
-## Quick start
+## Why This Exists
 
-### Option 1: Manual build & run
+**Problem:** Ollama's default context window is often too small, causing silent prompt truncation. But setting it too large wastes memory and slows down small requests.
+
+**Solution:** This proxy automatically chooses the right `options.num_ctx` based on your actual prompt size, with bucket-based allocation that keeps small prompts fast.
+
+---
+
+## Features
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| **Auto Context Sizing** | Estimates needed context and injects optimal `num_ctx` | Always on |
+| **Bucket Allocation** | Rounds up to predefined sizes for efficiency | Always on |
+| **Auto-Calibration** | Learns from Ollama's actual token counts per model | Enabled |
+| **Watchdog Timeouts** | Cancels stuck requests (TTFB/stall/hard timeouts) | Disabled |
+| **Loop Detection** | Detects and cancels degenerate repeating output | Disabled |
+| **Retry Logic** | Retries failed non-streaming requests | Disabled |
+| **Restart Hook** | Restarts Ollama on repeated failures | Disabled |
+| **Observability** | Real-time request monitoring via SSE/JSON endpoints | Disabled |
+| **Prometheus Metrics** | Exposes Prometheus-format metrics for monitoring | Disabled |
+| **Health Check** | Monitors upstream Ollama health status | Disabled |
+| **Output Token Limiting** | Prevents runaway generations with configurable limits | Disabled |
+
+---
+
+## Quick Start
+
+### Option 1: Build and Run
 
 ```bash
 go build -o ollama-auto-ctx ./cmd/ollama-auto-ctx
-
-# upstream ollama: http://localhost:11434
-# proxy:          http://localhost:11435
 ./ollama-auto-ctx
 ```
 
-### Option 2: Systemd service (recommended for production)
+### Option 2: Systemd Service
 
 ```bash
-# Install as systemd service (requires root)
 sudo ./install.sh install
-
-# Or install with custom binary
-sudo ./install.sh install --binary-path ./ollama-auto-ctx
-
-# Or use existing binary without building
-sudo ./install.sh install --no-build
-
-# Start the service
 sudo systemctl start ollama-auto-ctx
-
-# Check status
-sudo systemctl status ollama-auto-ctx
-
-# Uninstall (includes cleanup prompts)
-sudo ./install.sh uninstall
 ```
-
-The installer creates:
-- Service user and directories
-- Systemd service file
-- Configuration file at `/etc/ollama-auto-ctx/environment`
-- Calibration persistence (survives restarts)
-
-**Installation Options:**
-- `--binary-path PATH`: Use existing binary instead of building
-- `--no-build`: Use existing binary in install directory
-- `--service-name NAME`: Custom service name
-- `--listen-addr ADDR`: Custom listen address
-- `--upstream-url URL`: Custom Ollama URL
-
-Point clients (n8n, OpenWebUI, custom code) at:
-
-- `http://localhost:11435` *(proxy)*
-
-instead of:
-
-- `http://localhost:11434` *(ollama)*
 
 ### Option 3: Docker
 
@@ -85,143 +55,204 @@ docker run --rm -p 11435:11435 \
   ollama-auto-ctx
 ```
 
----
-
-## How `num_ctx` is chosen
-
-For `/api/chat` and `/api/generate`, the proxy uses a simple, fast model:
-
-```
-prompt_tokens_est = FixedOverhead
-                 + PerMessageOverhead * messageCount
-                 + TokensPerByte      * textBytes
-                 + imageTokens
-
-output_budget   = options.num_predict (clamped) 
-                 OR (if DYNAMIC_DEFAULT_OUTPUT_BUDGET=true: max(DEFAULT_OUTPUT_BUDGET, 256 + prompt_tokens_est/2))
-                 OR DEFAULT_OUTPUT_BUDGET
-needed          = prompt_tokens_est + output_budget
-needed_headroom = ceil(needed * HEADROOM)
-
-num_ctx  = smallest bucket >= needed_headroom
-num_ctx  = clamp(num_ctx, MIN_CTX, min(MAX_CTX, model_max_ctx, safe_max_ctx))
-```
-
-Then it applies an override policy (see `OVERRIDE_NUM_CTX`): by default it **only increases** an existing `options.num_ctx` if it looks too small.
-
-> **Important:** The proxy uses `options.num_predict` from your request (if provided) to estimate the output budget. If you want a **large output response**, you have two options:
-> 1. **Explicitly set `options.num_predict`** in your request (always respected)
-> 2. **Enable `DYNAMIC_DEFAULT_OUTPUT_BUDGET=true`** to automatically adjust the default budget based on prompt size (useful for workflows like n8n that generate large JSON outputs)
-> 
-> Without either, the proxy defaults to `DEFAULT_OUTPUT_BUDGET` (1024 tokens), which may truncate very long responses.
-
-> Want the deep dive? See **docs/ARCHITECTURE.md** and **docs/DESIGN_DECISIONS.md**.
+**Point your clients at:** `http://localhost:11435` (instead of `:11434`)
 
 ---
 
-## Buckets (performance vs. precision)
+## Configuration Reference
 
-Buckets are the key to keeping “hello world” fast while still handling large prompts safely.
+Configuration via environment variables or command-line flags (flags override env).
 
-- If you use **huge** `num_ctx` for everything, you may pay unnecessary KV‑cache cost for tiny requests.
-- If you use **tiny** `num_ctx`, you’ll truncate system prompt/history and get erratic behavior.
+### Core Settings
 
-The proxy solves this by rounding up to the **smallest** bucket that fits.
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `LISTEN_ADDR` | `--listen` | `:11435` | Proxy listen address |
+| `UPSTREAM_URL` | `--upstream` | `http://localhost:11434` | Ollama upstream URL |
+| `LOG_LEVEL` | `--log-level` | `info` | Log level (debug/info/warn/error) |
 
-**Default buckets (fine-grained for precise allocation):**
+### Context Window Sizing
 
-```
-1024,2048,4096,8192,9216,10240,11264,12288,13312,14336,15360,16384,20480,24576,28672,32768,36864,40960,45056,49152,53248,57344,61440,65536,69632,73728,77824,81920,86016,90112,94208,98304,102400
-```
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `MIN_CTX` | `--min-ctx` | `1024` | Minimum context size |
+| `MAX_CTX` | `--max-ctx` | `81920` | Maximum context size |
+| `BUCKETS` | `--buckets` | `1024,2048,...102400` | Comma-separated context buckets |
+| `HEADROOM` | `--headroom` | `1.25` | Safety multiplier for token estimates |
+| `OVERRIDE_NUM_CTX` | `--override-policy` | `if_too_small` | Override policy: `always`, `if_missing`, `if_too_small` |
 
-These buckets provide fine-grained control to minimize over-allocation while still keeping small prompts fast. The default range goes from 1K to 100K tokens.
+### Output Budgeting
 
-**Example: simpler buckets (fewer options, easier to manage):**
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `DEFAULT_OUTPUT_BUDGET` | `--default-output` | `1024` | Default output tokens when `num_predict` not set |
+| `MAX_OUTPUT_BUDGET` | `--max-output` | `10240` | Maximum output token budget |
+| `STRUCTURED_OVERHEAD` | `--structured-overhead` | `128` | Extra tokens for JSON/structured output |
+| `DYNAMIC_DEFAULT_OUTPUT_BUDGET` | `--dynamic-default-output` | `false` | Adjust default budget based on prompt size |
+
+### Calibration
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `CALIBRATION_ENABLED` | `--calibrate` | `true` | Enable auto-calibration |
+| `CALIBRATION_FILE` | `--calibration-file` | `` | Path to persist calibration data |
+| `DEFAULT_TOKENS_PER_BYTE` | - | `0.25` | Initial tokens/byte estimate (~4 bytes/token) |
+| `DEFAULT_TOKENS_PER_IMAGE` | - | `768` | Tokens per image fallback |
+
+### HTTP/Performance
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `CORS_ALLOW_ORIGIN` | `--cors-origin` | `*` | CORS header (empty to disable) |
+| `FLUSH_INTERVAL` | `--flush-interval` | `100ms` | Streaming flush interval |
+| `REQUEST_BODY_MAX_BYTES` | `--max-body` | `10MB` | Max request body to parse |
+| `RESPONSE_TAP_MAX_BYTES` | `--max-tap` | `5MB` | Max response to buffer for calibration |
+| `SHOW_CACHE_TTL` | `--show-ttl` | `5m` | TTL for `/api/show` cache |
+
+---
+
+## Supervisor Features
+
+All supervisor features are **opt-in** and **disabled by default**. Enable the supervisor layer first:
 
 ```bash
-BUCKETS=2048,4096,8192,16384,32768,65536
+SUPERVISOR_ENABLED=true
+SUPERVISOR_TRACK_REQUESTS=true  # Required for most features
 ```
 
-Tip: finer buckets reduce "jump" overhead (e.g. 9000 → 10240 instead of 16384). The trade-off is maintaining a longer bucket list.
+### Watchdog Timeouts
+
+Cancels requests that exceed timeout thresholds. Prevents indefinitely hanging requests.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERVISOR_WATCHDOG_ENABLED` | `--supervisor-watchdog-enabled` | `false` | Enable watchdog |
+| `SUPERVISOR_TTFB_TIMEOUT` | `--supervisor-ttfb-timeout` | `120s` | Time-to-first-byte timeout |
+| `SUPERVISOR_STALL_TIMEOUT` | `--supervisor-stall-timeout` | `45s` | Stall timeout (no activity after first byte) |
+| `SUPERVISOR_HARD_TIMEOUT` | `--supervisor-hard-timeout` | `12m` | Total request duration limit |
+
+**Recommended values:**
+- Interactive chat: `30s` / `15s` / `5m`
+- Batch processing: `120s` / `60s` / `30m`
+
+### Loop Detection
+
+Detects and cancels degenerate repeating output patterns. Uses n-gram analysis on streaming output.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERVISOR_LOOP_DETECT_ENABLED` | `--supervisor-loop-detect` | `false` | Enable loop detection |
+| `SUPERVISOR_LOOP_WINDOW_BYTES` | `--supervisor-loop-window` | `4096` | Rolling window size |
+| `SUPERVISOR_LOOP_NGRAM_BYTES` | `--supervisor-loop-ngram` | `64` | N-gram size for detection |
+| `SUPERVISOR_LOOP_REPEAT_THRESHOLD` | `--supervisor-loop-threshold` | `3` | Repeats needed to trigger |
+| `SUPERVISOR_LOOP_MIN_OUTPUT_BYTES` | `--supervisor-loop-min-output` | `1024` | Minimum output before activation |
+
+**Caution:** This is conservative by design. Tune thresholds based on your models.
+
+### Retry Logic
+
+Retries failed requests automatically. **Non-streaming only by default** to preserve streaming semantics.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERVISOR_RETRY_ENABLED` | `--supervisor-retry-enabled` | `false` | Enable retries |
+| `SUPERVISOR_RETRY_MAX_ATTEMPTS` | `--supervisor-retry-attempts` | `2` | Maximum retry attempts |
+| `SUPERVISOR_RETRY_BACKOFF` | `--supervisor-retry-backoff` | `250ms` | Backoff between retries |
+| `SUPERVISOR_RETRY_ONLY_NON_STREAMING` | `--supervisor-retry-non-streaming` | `true` | Only retry non-streaming |
+| `SUPERVISOR_RETRY_MAX_RESPONSE_BYTES` | `--supervisor-retry-max-response` | `8MB` | Max response to buffer |
+
+**Why non-streaming only?** Retrying after partial streaming output would break the 1:1 API semantics.
+
+### Restart Hook
+
+Restarts Ollama after repeated failures. Protected by cooldown and rate limits.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERVISOR_RESTART_ENABLED` | `--supervisor-restart-enabled` | `false` | Enable restart hook |
+| `SUPERVISOR_RESTART_CMD` | `--supervisor-restart-cmd` | `` | Command to execute (required) |
+| `SUPERVISOR_RESTART_COOLDOWN` | `--supervisor-restart-cooldown` | `120s` | Minimum time between restarts |
+| `SUPERVISOR_RESTART_MAX_PER_HOUR` | `--supervisor-restart-max-hour` | `3` | Maximum restarts per hour |
+| `SUPERVISOR_RESTART_TRIGGER_CONSEC_TIMEOUTS` | `--supervisor-restart-trigger` | `2` | Consecutive timeouts to trigger |
+| `SUPERVISOR_RESTART_CMD_TIMEOUT` | `--supervisor-restart-cmd-timeout` | `30s` | Command execution timeout |
+
+**Example commands:**
+```bash
+# Systemd
+SUPERVISOR_RESTART_CMD="systemctl restart ollama"
+
+# Docker
+SUPERVISOR_RESTART_CMD="docker restart ollama"
+
+# Direct
+SUPERVISOR_RESTART_CMD="pkill ollama && sleep 2 && ollama serve &"
+```
+
+**Warning:** Restarts kill in-flight requests. Use conservative thresholds.
+
+### Observability Endpoints
+
+Real-time monitoring for GUIs and dashboards.
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `SUPERVISOR_OBS_ENABLED` | `--supervisor-obs-enabled` | `false` | Enable observability |
+| `SUPERVISOR_OBS_REQUESTS_ENDPOINT` | `--supervisor-obs-requests` | `true` | Enable `/debug/requests` |
+| `SUPERVISOR_OBS_SSE_ENDPOINT` | `--supervisor-obs-sse` | `true` | Enable `/events` SSE |
+| `SUPERVISOR_OBS_PROGRESS_INTERVAL` | `--supervisor-obs-progress-interval` | `250ms` | Progress event throttling |
+| `SUPERVISOR_RECENT_BUFFER` | `--supervisor-buffer` | `200` | Recent requests to keep |
+
+**Endpoints:**
+
+```bash
+# JSON snapshot of current state
+curl http://localhost:11435/debug/requests
+
+# Server-Sent Events stream
+curl -N http://localhost:11435/events
+```
+
+**Event types:** `request_start`, `first_byte`, `progress`, `done`, `canceled`, `timeout_ttfb`, `timeout_stall`, `timeout_hard`, `upstream_error`, `loop_detected`
 
 ---
 
-## Configuration
+## Example Configuration
 
-Configuration works via **environment variables** or **flags** (flags override env).
-
-Common env vars:
-
-- `LISTEN_ADDR` (default `:11435`)
-- `UPSTREAM_URL` (default `http://localhost:11434`)
-
-Context sizing:
-
-- `MIN_CTX` (default `1024`)
-- `MAX_CTX` (default `81920`)
-- `BUCKETS` (default `1024,2048,4096,8192,9216,10240,11264,12288,13312,14336,15360,16384,20480,24576,28672,32768,36864,40960,45056,49152,53248,57344,61440,65536,69632,73728,77824,81920,86016,90112,94208,98304,102400`)
-- `HEADROOM` (default `1.25`)
-
-Output budgeting:
-
-- `DEFAULT_OUTPUT_BUDGET` (default `1024`) — used when `options.num_predict` is not provided in the request
-- `MAX_OUTPUT_BUDGET` (default `10240`) — maximum output budget (clamps `options.num_predict` if provided)
-- `DYNAMIC_DEFAULT_OUTPUT_BUDGET` (default `false`) — if `true`, automatically adjusts default output budget based on prompt size
-
-**Dynamic Default Output Budget:**
-
-When `DYNAMIC_DEFAULT_OUTPUT_BUDGET=true` and `options.num_predict` is **not** set in the request, the proxy computes:
-```
-dynamic_default = max(DEFAULT_OUTPUT_BUDGET, 256 + prompt_tokens_est/2)
-output_budget = min(dynamic_default, MAX_OUTPUT_BUDGET)
-```
-
-This helps with workflows (like n8n) that generate large JSON outputs without explicitly setting `num_predict`. Small prompts stay near `DEFAULT_OUTPUT_BUDGET` (fast), while larger prompts automatically reserve more room for output.
-
-**Examples:**
-- Prompt ≈ 600 tokens: dynamic default ≈ 556 (minimal change from 1024)
-- Prompt ≈ 10,000 tokens: dynamic default ≈ 5,256 (much safer than fixed 1024)
-
-The proxy logs the output budget source in each `ctx decision` log entry as `output_budget_source`, showing whether it came from:
-- `"explicit_num_predict"` — user provided `options.num_predict`
-- `"dynamic_default"` — computed using dynamic algorithm
-- `"fixed_default"` — used fixed `DEFAULT_OUTPUT_BUDGET`
-
-> **Note:** If you explicitly set `options.num_predict` in your request, it always takes precedence (dynamic logic is bypassed). For example:
-> ```json
-> {
->   "model": "llama3",
->   "messages": [...],
->   "options": {
->     "num_predict": 8192
->   }
-> }
-> ```
-> The proxy will include this in its context size calculation, ensuring `num_ctx` is large enough for both the prompt and the expected output.
-
-Override behavior:
-
-- `OVERRIDE_NUM_CTX` = `always|if_missing|if_too_small` (default `if_too_small`)
-
-Calibration:
-
-- `CALIBRATION_ENABLED` (default `true`)
-- `CALIBRATION_FILE` (optional; if set, calibration survives restarts)
-
-System prompt manipulation:
-
-- `STRIP_SYSTEM_PROMPT_TEXT` (optional; text to remove from system prompts)
-
-Example:
+### Minimal (just auto-context)
 
 ```bash
-LISTEN_ADDR=:11435 \
-UPSTREAM_URL=http://localhost:11434 \
-MIN_CTX=1024 \
-MAX_CTX=65536 \
-BUCKETS=2048,4096,8192,16384,32768,65536 \
-DYNAMIC_DEFAULT_OUTPUT_BUDGET=true \
-CALIBRATION_FILE=./data/calibration.json \
+./ollama-auto-ctx
+```
+
+### Production with monitoring
+
+```bash
+SUPERVISOR_ENABLED=true \
+SUPERVISOR_TRACK_REQUESTS=true \
+SUPERVISOR_WATCHDOG_ENABLED=true \
+SUPERVISOR_TTFB_TIMEOUT=60s \
+SUPERVISOR_STALL_TIMEOUT=30s \
+SUPERVISOR_HARD_TIMEOUT=10m \
+SUPERVISOR_OBS_ENABLED=true \
+CALIBRATION_FILE=/var/lib/ollama-auto-ctx/calibration.json \
+./ollama-auto-ctx
+```
+
+### Aggressive protection
+
+```bash
+SUPERVISOR_ENABLED=true \
+SUPERVISOR_TRACK_REQUESTS=true \
+SUPERVISOR_WATCHDOG_ENABLED=true \
+SUPERVISOR_TTFB_TIMEOUT=30s \
+SUPERVISOR_LOOP_DETECT_ENABLED=true \
+SUPERVISOR_OUTPUT_LIMIT_ENABLED=true \
+SUPERVISOR_OUTPUT_LIMIT_TOKENS=10000 \
+SUPERVISOR_RETRY_ENABLED=true \
+SUPERVISOR_RESTART_ENABLED=true \
+SUPERVISOR_RESTART_CMD="systemctl restart ollama" \
+SUPERVISOR_HEALTH_CHECK_ENABLED=true \
+SUPERVISOR_METRICS_ENABLED=true \
 ./ollama-auto-ctx
 ```
 
@@ -229,106 +260,59 @@ CALIBRATION_FILE=./data/calibration.json \
 
 ## Thinking Mode Support
 
-Some models support a "thinking" or "reasoning" mode that can be controlled via a parameter.
-
-The proxy supports this via **system prompt directives**:
-
-Add `__think=<verdict>` anywhere in your system prompt (typically at the end):
+Control model thinking/reasoning via system prompt directives:
 
 ```json
 {
-  "model": "gpt-oss:20b",
+  "model": "qwen3:latest",
   "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant. __think=high"
-    },
-    {
-      "role": "user",
-      "content": "Explain quantum computing"
-    }
+    {"role": "system", "content": "You are helpful. __think=true"}
   ]
 }
 ```
 
-The proxy will:
-1. Detect and extract `__think=high` from the system prompt
-2. Remove it from the prompt (so Ollama doesn't see it)
-3. Inject `"think": "high"` at the top level of the request
-4. Forward the cleaned request to Ollama
+The proxy extracts `__think=<value>`, removes it from the prompt, and injects the appropriate `think` parameter.
 
-**Result sent to Ollama:**
-```json
-{
-  "model": "gpt-oss:20b",
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant."
-    },
-    {
-      "role": "user",
-      "content": "Explain quantum computing"
-    }
-  ],
-  "think": "high",
-  "options": {
-    "num_ctx": 8192
-  }
-}
-```
+| Model Family | Valid Values |
+|--------------|--------------|
+| qwen3, deepseek | `true`, `false` |
+| gpt-oss | `low`, `medium`, `high` |
 
-### Supported Models
+---
 
-- **qwen3**: Boolean thinking mode
-  - `__think=true` or `__think=false`
-- **deepseek**: Boolean thinking mode
-  - `__think=true` or `__think=false`
-- **gpt-oss**: Level-based thinking mode
-  - `__think=low`, `__think=medium`, or `__think=high`
+## Health Check
 
-Invalid verdicts for the model family are silently ignored (fail-open behavior)
-
-### System Prompt Stripping
-
-If you need to remove proxy-specific instructions from system prompts:
+The proxy provides health check endpoints:
 
 ```bash
-STRIP_SYSTEM_PROMPT_TEXT="text to remove"
+# Basic health (proxy only)
+curl http://localhost:11435/healthz
+# Returns: ok (200)
+
+# Combined health (proxy + upstream, if health check enabled)
+# Returns: ok (200) or upstream unhealthy (503)
+
+# Upstream health details (if health check enabled)
+curl http://localhost:11435/healthz/upstream
+# Returns: {"healthy": true, "last_check": "2024-01-11T...", "last_error": ""}
 ```
 
-This can be set via environment variable or the `--strip-system-prompt` flag.
-
 ---
 
-## Health
+## Architecture
 
-- `GET /healthz` → `200 ok`
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed flow diagrams and component descriptions.
 
----
+## Design Decisions
 
-## Notes / limitations
+See [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md) for the reasoning behind key choices.
 
-- Estimation starts as a **best-effort heuristic**, then improves via calibration.
-- This proxy does **not** translate OpenAI `/v1/*` endpoints into Ollama endpoints — it forwards them unchanged.
-- No auth by default; assume a trusted network or put it behind a gateway.
-- **Output size:** The proxy cannot know your desired output length. If you need large responses:
-  - Explicitly set `options.num_predict` in your request (always respected), or
-  - Enable `DYNAMIC_DEFAULT_OUTPUT_BUDGET=true` to automatically adjust based on prompt size
-  - Without either, the default output budget (1024 tokens) is used, which may cause truncation for very long outputs
+## Contributing
 
----
-
-## Docs
-
-- **docs/ARCHITECTURE.md** — end-to-end request flow + components
-- **docs/DESIGN_DECISIONS.md** — “why this design” and trade-offs
-- **docs/OPERATIONS.md** — perf, deployment, security, and ops notes
-- **docs/AGENTS.md** — a “map of the repo” for AI agents and contributors
-
+See [docs/AGENTS.md](docs/AGENTS.md) for a quick orientation to the codebase.
 
 ---
 
 ## License
 
-Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+Apache License 2.0

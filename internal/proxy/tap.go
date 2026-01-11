@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"ollama-auto-ctx/internal/calibration"
+	"ollama-auto-ctx/internal/supervisor"
 	"ollama-auto-ctx/internal/util"
 )
 
@@ -28,9 +29,19 @@ type TapReadCloser struct {
 
 	maxBuffer int64
 
-	sample calibration.Sample
-	store  *calibration.Store
-	logger *slog.Logger
+	sample       calibration.Sample
+	store        *calibration.Store
+	tracker      *supervisor.Tracker
+	loopDetector *supervisor.LoopDetector
+	requestID    string
+	logger       *slog.Logger
+
+	// Output token limiting
+	outputTokenLimit  int64
+	outputLimitAction string // "cancel" or "warn"
+	cancelFunc        func()
+	limitExceeded     bool
+	minOutputBytes    int64 // minimum bytes before checking limit
 
 	// ndjsonBuf holds any incomplete line between reads.
 	ndjsonBuf []byte
@@ -39,30 +50,85 @@ type TapReadCloser struct {
 	jsonBuf          []byte
 	jsonBufTruncated bool
 
-	observed bool
+	observed      bool
+	firstByteSent bool
+	totalBytes    int64 // total bytes read for limit checking
 }
 
 // NewTapReadCloser wraps rc and returns a ReadCloser that updates the calibration store.
-func NewTapReadCloser(rc io.ReadCloser, contentType string, _ int64, maxBuffer int64, sample calibration.Sample, store *calibration.Store, logger *slog.Logger) io.ReadCloser {
+func NewTapReadCloser(rc io.ReadCloser, contentType string, _ int64, maxBuffer int64, sample calibration.Sample, store *calibration.Store, tracker *supervisor.Tracker, loopDetector *supervisor.LoopDetector, requestID string, logger *slog.Logger, outputTokenLimit int64, outputLimitAction string, cancelFunc func(), minOutputBytes int64) io.ReadCloser {
 	ctLower := strings.ToLower(contentType)
 	isNDJSON := strings.Contains(ctLower, "application/x-ndjson")
 	isJSON := strings.Contains(ctLower, "application/json")
 
 	return &TapReadCloser{
-		rc:        rc,
-		isNDJSON:  isNDJSON,
-		isJSON:    isJSON,
-		maxBuffer: maxBuffer,
-		sample:    sample,
-		store:     store,
-		logger:    logger,
+		rc:                rc,
+		isNDJSON:          isNDJSON,
+		isJSON:             isJSON,
+		maxBuffer:          maxBuffer,
+		sample:             sample,
+		store:              store,
+		tracker:            tracker,
+		loopDetector:       loopDetector,
+		requestID:          requestID,
+		logger:             logger,
+		outputTokenLimit:   outputTokenLimit,
+		outputLimitAction:  outputLimitAction,
+		cancelFunc:         cancelFunc,
+		minOutputBytes:     minOutputBytes,
 	}
 }
 
 func (t *TapReadCloser) Read(p []byte) (int, error) {
 	n, err := t.rc.Read(p)
-	if n > 0 && !t.observed {
-		t.process(p[:n])
+	if n > 0 {
+		// Track first byte sent
+		if !t.firstByteSent && t.tracker != nil && t.requestID != "" {
+			t.tracker.MarkFirstByte(t.requestID)
+			t.firstByteSent = true
+		}
+
+		// Track progress
+		if t.tracker != nil && t.requestID != "" {
+			t.tracker.MarkProgress(t.requestID, int64(n))
+		}
+
+		// Update total bytes for limit checking
+		t.totalBytes += int64(n)
+
+		// Check output token limit (only after minimum output threshold)
+		if t.outputTokenLimit > 0 && !t.limitExceeded && t.totalBytes >= t.minOutputBytes {
+			estimated := t.estimateOutputTokens()
+			if estimated > t.outputTokenLimit {
+				t.limitExceeded = true
+				if t.outputLimitAction == "cancel" && t.cancelFunc != nil {
+					// Cancel the request
+					t.cancelFunc()
+					if t.tracker != nil && t.requestID != "" {
+						t.tracker.Finish(t.requestID, supervisor.StatusOutputLimitExceeded, nil)
+					}
+					// Return error to signal cancellation
+					return n, io.EOF
+				} else {
+					// Warn only - log and mark in tracker but continue
+					if t.logger != nil {
+						t.logger.Warn("output token limit exceeded",
+							"request_id", t.requestID,
+							"estimated_tokens", estimated,
+							"limit", t.outputTokenLimit,
+							"action", "warn")
+					}
+					// Mark in tracker so metric is recorded when request finishes
+					if t.tracker != nil && t.requestID != "" {
+						t.tracker.MarkOutputLimitExceeded(t.requestID)
+					}
+				}
+			}
+		}
+
+		if !t.observed {
+			t.process(p[:n])
+		}
 	}
 	if err == io.EOF {
 		// Best-effort parse of any trailing bytes.
@@ -71,6 +137,44 @@ func (t *TapReadCloser) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// feedLoopDetector extracts text content from NDJSON and feeds it to the loop detector.
+// It returns true if a loop was detected (and the request was cancelled).
+func (t *TapReadCloser) feedLoopDetector(line []byte) bool {
+	if t.loopDetector == nil {
+		return false
+	}
+
+	// Try to extract text delta from the NDJSON line
+	// Ollama returns either "response" (for /api/generate) or "message.content" (for /api/chat)
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		// If parsing fails, fail open - don't feed garbage to detector
+		return false
+	}
+
+	var textDelta string
+
+	// Check for /api/generate format: {"response": "text..."}
+	if resp, ok := m["response"].(string); ok {
+		textDelta = resp
+	}
+
+	// Check for /api/chat format: {"message": {"content": "text..."}}
+	if msg, ok := m["message"].(map[string]any); ok {
+		if content, ok := msg["content"].(string); ok {
+			textDelta = content
+		}
+	}
+
+	if textDelta != "" {
+		return t.loopDetector.Feed([]byte(textDelta))
+	}
+
+	return false
 }
 
 func (t *TapReadCloser) Close() error {
@@ -96,6 +200,11 @@ func (t *TapReadCloser) process(chunk []byte) {
 			if len(line) == 0 {
 				continue
 			}
+
+			// Feed to loop detector (fail-open: if detection fails, continue normally)
+			// Loop detector will cancel the request if loop is detected
+			t.feedLoopDetector(line)
+
 			t.tryParseJSON(line)
 			if t.observed {
 				return
@@ -162,4 +271,17 @@ func (t *TapReadCloser) tryParseJSON(line []byte) {
 	if t.logger != nil {
 		t.logger.Debug("calibration observation", "model", t.sample.Model, "prompt_eval_count", n)
 	}
+}
+
+// estimateOutputTokens estimates output tokens from bytes using calibration store.
+func (t *TapReadCloser) estimateOutputTokens() int64 {
+	// Use calibration store if available, otherwise use default
+	defaultTokensPerByte := 0.25
+	if t.store != nil {
+		params := t.store.Get(t.sample.Model)
+		if params.TokensPerByte > 0 {
+			defaultTokensPerByte = params.TokensPerByte
+		}
+	}
+	return supervisor.EstimateOutputTokens(t.totalBytes, t.sample.Model, t.store, defaultTokensPerByte)
 }

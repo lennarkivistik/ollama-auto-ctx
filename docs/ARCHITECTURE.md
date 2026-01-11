@@ -6,185 +6,348 @@ If you just want to run it, start with the README. If you want to change how `nu
 
 ---
 
-## High-level flow
+## High-Level Flow
 
-1. Client sends a request to the proxy.
-2. Proxy checks for:
-   - `/healthz`
-   - CORS preflight
-3. For normal traffic, the proxy behaves like a standard reverse proxy **except** for:
-   - `POST /api/chat`
-   - `POST /api/generate`
-4. For those two endpoints, the proxy:
-   - reads and parses the JSON body (bounded by a max size)
-   - extracts features (text bytes, message count, image count, requested output tokens, existing `num_ctx`, etc.)
-   - fetches model metadata via `/api/show` (cached) to learn max context and image token cost
-   - estimates needed prompt tokens
-   - budgets expected output tokens
-   - applies headroom + bucketization + clamping
-   - decides whether to override user-provided `num_ctx` based on policy
-   - forwards the modified request to Ollama
-5. The response is forwarded **byte-for-byte**, with a “tap” that observes `prompt_eval_count` to auto-calibrate.
+```
+┌──────────┐     ┌─────────────────────────────────────────────────────┐     ┌────────┐
+│  Client  │────▶│                   Proxy                              │────▶│ Ollama │
+└──────────┘     │  ┌─────────────────────────────────────────────────┐ │     └────────┘
+                 │  │ 1. Health check / CORS / Observability routing  │ │
+                 │  │ 2. Start tracking (if enabled)                  │ │
+                 │  │ 3. Parse request body                           │ │
+                 │  │ 4. Extract features (text, messages, images)    │ │
+                 │  │ 5. Fetch model limits (/api/show, cached)       │ │
+                 │  │ 6. Estimate prompt tokens                       │ │
+                 │  │ 7. Budget output tokens                         │ │
+                 │  │ 8. Apply headroom + bucketize + clamp           │ │
+                 │  │ 9. Inject/adjust options.num_ctx                │ │
+                 │  │10. Forward via ReverseProxy                     │ │
+                 │  └─────────────────────────────────────────────────┘ │
+                 │                        │                             │
+                 │  ┌─────────────────────▼─────────────────────────┐   │
+                 │  │              Response Tap                      │   │
+                 │  │ • Forward bytes immediately (streaming safe)   │   │
+                 │  │ • Track first byte + progress                  │   │
+                 │  │ • Feed loop detector (if enabled)              │   │
+                 │  │ • Extract prompt_eval_count for calibration    │   │
+                 │  └───────────────────────────────────────────────┘   │
+                 │                        │                             │
+                 │  ┌─────────────────────▼─────────────────────────┐   │
+                 │  │             Supervisor (opt-in)                │   │
+                 │  │ • Watchdog: timeout monitoring                 │   │
+                 │  │ • Loop detection: n-gram analysis              │   │
+                 │  │ • Restart hook: failure tracking               │   │
+                 │  │ • Event bus: SSE publishing                    │   │
+                 │  └───────────────────────────────────────────────┘   │
+                 └──────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Streaming behavior (NDJSON)
+## Streaming Behavior (NDJSON)
 
 Ollama streams partial results using **HTTP chunked transfer** with **newline-delimited JSON (NDJSON)**.
 
 This proxy does **not** buffer streamed output. It forwards bytes immediately and parses only what it needs:
-- if streaming: it scans for `\n` boundaries and attempts to parse each JSON line
-- when it sees the final `done=true` object (or a final JSON object), it extracts `prompt_eval_count`
-- it stops parsing after it has what it needs
+- If streaming: scans for `\n` boundaries and parses each JSON line
+- Extracts `prompt_eval_count` from the final response for calibration
+- Stops parsing after getting what it needs
 
-This keeps latency the same as upstream.
+**Result:** Latency is the same as upstream.
 
 ---
 
-## Core context sizing formula
+## Context Sizing Formula
 
 At rewrite time, the proxy computes:
 
 ```
 prompt_tokens_est = FixedOverhead
-                 + PerMessageOverhead * messageCount
-                 + TokensPerByte      * textBytes
-                 + imageTokens
+                  + PerMessageOverhead × messageCount
+                  + TokensPerByte × textBytes
+                  + imageTokens
 
-output_budget   = options.num_predict (clamped) 
-                 OR (if DYNAMIC_DEFAULT_OUTPUT_BUDGET=true: max(DEFAULT_OUTPUT_BUDGET, 256 + prompt_tokens_est/2))
-                 OR DEFAULT_OUTPUT_BUDGET
+output_budget = options.num_predict (if provided, clamped)
+             OR dynamic_default (if DYNAMIC_DEFAULT_OUTPUT_BUDGET=true)
+             OR DEFAULT_OUTPUT_BUDGET
+
 needed          = prompt_tokens_est + output_budget
-needed_headroom = ceil(needed * HEADROOM)
+needed_headroom = ceil(needed × HEADROOM)
 
-num_ctx  = smallest bucket >= needed_headroom
-num_ctx  = clamp(num_ctx, MIN_CTX, min(MAX_CTX, model_max_ctx, safe_max_ctx))
+num_ctx = smallest bucket >= needed_headroom
+num_ctx = clamp(num_ctx, MIN_CTX, min(MAX_CTX, model_max, safe_max))
 ```
 
-### Why this "heuristic + calibration" approach?
+### Why This Approach?
 
-Exact tokenization is model- and template-dependent. Instead of shipping tokenizers and trying to replicate Ollama's internal prompt rendering, the proxy uses a cheap approximation that becomes accurate over time by learning from `prompt_eval_count`.
+Exact tokenization is model- and template-dependent. Instead of shipping tokenizers, the proxy uses a cheap approximation that becomes accurate over time via calibration.
 
 ---
 
-## Thinking Mode Support
+## Component Details
 
-The proxy supports model-specific thinking modes via `__think=<verdict>` directives in system prompts.
+### Request Tracking (`internal/supervisor/tracker.go`)
 
-### Detection Method
+Maintains lifecycle state for each request:
 
-**System Prompt Directive**
-- Detects `__think=<verdict>` anywhere in system prompts
-- Automatically strips it from the prompt before sending to Ollama
-- Works for both `/api/generate` (system field) and `/api/chat` (system role messages)
-
-### Supported Model Families
-
-- qwen3, deepseek: boolean (true/false) → `think` = bool
-- gpt-oss: level (low/medium/high) → `think` = string
-
-### Flow Example
-
-1. Client sends request:
-```json
-{
-  "model": "gpt-oss:20b",
-  "messages": [
-    {"role": "system", "content": "You are helpful. __think=high"}
-  ]
+```go
+type RequestInfo struct {
+    ID, Endpoint, Model, Stream
+    StartTime, FirstByteTime, LastActivityTime
+    BytesForwarded, Status, Error
 }
 ```
 
-2. Proxy extracts `__think=high` from system prompt
-3. Proxy validates `high` is valid for gpt-oss family
-4. Proxy removes `__think=high` from the system message content
-5. Proxy injects `"think": "high"` at top level of request
-6. Proxy forwards cleaned request to Ollama
+- **In-flight map:** Currently active requests
+- **Recent buffer:** O(1) circular buffer of completed requests
+- **Thread-safe:** Uses `sync.RWMutex`
 
-Result:
-```json
-{
-  "model": "gpt-oss:20b",
-  "messages": [{"role": "system", "content": "You are helpful."}],
-  "think": "high",
-  "options": {"num_ctx": 8192}
+### Watchdog (`internal/supervisor/watchdog.go`)
+
+Monitors in-flight requests and cancels those exceeding timeouts:
+
+| Timeout | Condition |
+|---------|-----------|
+| **TTFB** | No bytes received within timeout after start |
+| **Stall** | No activity after first byte was received |
+| **Hard** | Total duration exceeds limit |
+
+- Runs in separate goroutine
+- Checks every 1 second
+- Uses context cancellation
+- Fail-open: panics are recovered
+
+### Loop Detection (`internal/supervisor/loopdetect.go`)
+
+Detects repeating output patterns:
+
+1. Maintains rolling window of recent output bytes
+2. Tracks n-gram frequencies
+3. Triggers when any n-gram exceeds threshold
+4. Only activates after minimum output threshold
+
+**Fail-open:** If parsing fails, detection doesn't trigger.
+
+### Retry Logic (`internal/supervisor/retry.go`)
+
+For non-streaming requests only:
+
+1. Check eligibility (non-streaming, correct endpoint)
+2. Execute request with timeout
+3. On retriable error (5xx, connection error): wait backoff, retry
+4. On success or max attempts: return result
+
+**Response buffering:** Limited to configured max size.
+
+### Restart Hook (`internal/supervisor/restart.go`)
+
+Triggers Ollama restart on repeated failures:
+
+1. Track consecutive timeout count
+2. When threshold reached, execute restart command
+3. Apply cooldown and rate limiting
+4. Execute asynchronously (doesn't block requests)
+
+**Safety guards:**
+- Cooldown between restarts
+- Max restarts per hour
+- Only one restart at a time
+
+### Metrics Collector (`internal/supervisor/metrics.go`)
+
+Maintains Prometheus metrics for monitoring:
+
+- Counters: requests, bytes, tokens, timeouts, loops, limit exceeded
+- Histograms: request duration
+- Gauges: in-flight requests, upstream health
+
+Metrics are updated atomically and exposed via `/metrics` endpoint.
+
+### Health Checker (`internal/supervisor/healthcheck.go`)
+
+Periodically checks Ollama upstream health:
+
+1. Background goroutine pings `/api/tags` every interval
+2. Updates atomic health status
+3. Updates Prometheus gauge
+4. Exposes status via `/healthz` endpoints
+
+**Fail-open:** Health check failures don't affect request forwarding.
+
+### Event Bus (`internal/supervisor/events.go`)
+
+Publishes lifecycle events for SSE consumers:
+
+- **Bounded channel:** Prevents unbounded memory
+- **Non-blocking publish:** Uses `select` with `default`
+- **Fan-out:** Multiple subscribers receive same events
+- **Fail-open:** Full buffer = dropped events
+
+Event types: `request_start`, `first_byte`, `progress`, `done`, `canceled`, `timeout_*`, `upstream_error`, `loop_detected`
+
+### Response Tap (`internal/proxy/tap.go`)
+
+Wraps response body for streaming observation:
+
+```go
+func (t *TapReadCloser) Read(p []byte) (int, error) {
+    n, err := t.rc.Read(p)           // Read from upstream
+    if n > 0 {
+        t.tracker.MarkFirstByte()     // First byte tracking
+        t.tracker.MarkProgress(n)     // Progress tracking
+        t.loopDetector.Feed(data)     // Loop detection
+        t.checkOutputLimit()         // Output token limiting
+        t.parseCalibration(data)      // Calibration extraction
+    }
+    return n, err                     // Forward immediately
 }
 ```
 
-Invalid verdicts or unsupported model families are silently ignored (fail-open).
+**Output Token Limiting:**
+- Estimates tokens from bytes using calibration
+- Only checks after minimum output threshold
+- Cancel mode: cancels request when limit exceeded
+- Warn mode: logs warning but continues
+- Fail-open: estimation errors don't trigger limit
 
 ---
 
-## Repo map (important packages)
+## Observability Endpoints
 
-### `cmd/ollama-auto-ctx/main.go`
-Entry point:
-- loads config
-- constructs dependencies (Ollama client, show cache, calibration store, handler)
-- starts the HTTP server + graceful shutdown
+### `GET /debug/requests`
 
-### `internal/proxy/handler.go`
-Main HTTP handler:
-- routes health/CORS
-- detects whether a request is eligible for rewrite
-- rewrites request body when possible
-- forwards via `httputil.ReverseProxy`
-- attaches the streaming “tap” in the reverse-proxy response modifier
+Returns JSON snapshot:
 
-### `internal/proxy/tap.go`
-Streaming-safe response wrapper:
-- implements `io.ReadCloser`
-- forwards bytes to the client
-- parses NDJSON/JSON in a bounded way
-- extracts `prompt_eval_count` for calibration
+```json
+{
+  "in_flight": {
+    "123": {
+      "id": "123",
+      "endpoint": "/api/chat",
+      "model": "llama2",
+      "start_time": "...",
+      "bytes_forwarded": 1024,
+      "estimated_output_tokens": 256
+    }
+  },
+  "recent": [...]
+}
+```
 
-### `internal/estimate/estimate.go`
-All estimation math:
-- feature extraction for `/api/chat` and `/api/generate`
-- prompt token estimation
-- output token budgeting
-- headroom, bucketization, and clamping helpers
+### `GET /events`
 
-### `internal/calibration/store.go`
-Per-model learning:
-- stores per-model parameters (tokens/byte, fixed overhead, per-message overhead)
-- updates them using an EMA from observed `prompt_eval_count`
-- optionally persists to disk
+Server-Sent Events stream:
 
-### `internal/ollama/*`
-Model metadata:
-- `/api/show` client + parsing helpers
-- caching layer (TTL)
+```
+: connected
 
-### `internal/config/config.go`
-Configuration:
-- env + flags
-- validation (buckets ascending, limits sane)
+data: {"type":"request_start","request_id":"123",...}
+
+data: {"type":"first_byte","request_id":"123","ttfb_ms":1500,...}
+
+data: {"type":"progress","request_id":"123","bytes_out":2048,...}
+
+data: {"type":"done","request_id":"123","status":"success",...}
+```
+
+### `GET /metrics`
+
+Prometheus-format metrics:
+
+```
+# HELP ollama_proxy_requests_total Total number of requests processed
+# TYPE ollama_proxy_requests_total counter
+ollama_proxy_requests_total{endpoint="chat",model="llama2",status="success"} 42
+
+# HELP ollama_proxy_request_duration_seconds Request duration in seconds
+# TYPE ollama_proxy_request_duration_seconds histogram
+ollama_proxy_request_duration_seconds_bucket{endpoint="chat",model="llama2",le="0.005"} 10
+...
+
+# HELP ollama_proxy_upstream_healthy Upstream Ollama health status
+# TYPE ollama_proxy_upstream_healthy gauge
+ollama_proxy_upstream_healthy 1
+```
+
+### `GET /healthz`
+
+Combined proxy + upstream health:
+
+- Returns `200 OK` with "ok" if proxy and upstream are healthy
+- Returns `503 Service Unavailable` with "upstream unhealthy" if upstream is down (when health check enabled)
+
+### `GET /healthz/upstream`
+
+Upstream-only health with details:
+
+```json
+{
+  "healthy": true,
+  "last_check": "2024-01-11T22:30:00Z",
+  "last_error": ""
+}
+```
 
 ---
 
-## Data flow examples
+## Package Responsibilities
 
-### Small chat request
+| Package | Responsibility |
+|---------|----------------|
+| `cmd/ollama-auto-ctx` | Entry point, wiring, graceful shutdown |
+| `internal/config` | Env/flag parsing, validation |
+| `internal/proxy` | HTTP handler, reverse proxy, tap, endpoints |
+| `internal/estimate` | Feature extraction, token estimation, bucket logic |
+| `internal/calibration` | Per-model EMA learning, persistence |
+| `internal/ollama` | `/api/show` client, caching |
+| `internal/supervisor` | Tracking, watchdog, loop detection, retry, restart, events, metrics, health check |
 
-1. Extract: model, 1 message, 5 bytes of text, no images
+---
+
+## Data Flow Examples
+
+### Small Chat Request
+
+1. Extract: model, 1 message, 50 bytes text, no images
 2. Lookup model max context via cached `/api/show`
-3. Use current calibration params for the model
-4. Compute needed tokens, add output budget, apply headroom
-5. Bucketize → 2048
-6. Inject/adjust `options.num_ctx`
-7. Stream response back
-8. Observe `prompt_eval_count` and refine calibration slightly
+3. Use calibration params for model (or defaults)
+4. Compute: 50 × 0.25 + 8 + 32 = ~52 prompt tokens
+5. Add output budget (1024), apply headroom (1.25)
+6. Bucketize → 2048
+7. Inject `options.num_ctx`
+8. Stream response, extract `prompt_eval_count`
+9. Update calibration EMA
 
-### Large multimodal request
+### Large Multimodal Request
 
-Same flow, but `imageTokens` comes from model metadata (`tokens_per_image`), and the final `num_ctx` is clamped to the model’s actual max context.
+Same flow, but:
+- `imageTokens` from model metadata (`tokens_per_image`)
+- Final `num_ctx` clamped to model's max context
+- Larger bucket selected
+
+### Timeout Scenario
+
+1. Request starts, tracked
+2. No response bytes within TTFB timeout
+3. Watchdog cancels context
+4. Request marked as `timeout_ttfb`
+5. Event published
+6. Restart hook notified (if enabled)
 
 ---
 
-## Where to change things
+## Where to Change Things
 
-- **Bucket selection / increments**: `internal/estimate/estimate.go` (`Bucketize`)
-- **Estimation formula knobs**: `internal/calibration/store.go` (defaults + EMA update) and `internal/estimate/estimate.go` (how features are translated into token counts)
-- **Which endpoints are rewritten**: `internal/proxy/handler.go`
-- **Model max context / tokens-per-image extraction**: `internal/ollama/client.go`
+| Change | Location |
+|--------|----------|
+| Bucket selection | `internal/estimate/estimate.go` → `Bucketize()` |
+| Estimation formula | `internal/estimate/estimate.go`, `internal/calibration/store.go` |
+| Rewritten endpoints | `internal/proxy/handler.go` → `ServeHTTP()` |
+| Model metadata extraction | `internal/ollama/client.go` |
+| Timeout behavior | `internal/supervisor/watchdog.go` |
+| Loop detection tuning | `internal/supervisor/loopdetect.go` |
+| Retry policy | `internal/supervisor/retry.go` |
+| Restart conditions | `internal/supervisor/restart.go` |
+| Metrics exposed | `internal/supervisor/metrics.go` |
+| Health check behavior | `internal/supervisor/healthcheck.go` |
+| Output limit behavior | `internal/proxy/tap.go` → `Read()` |

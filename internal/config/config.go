@@ -75,6 +75,59 @@ type Config struct {
 
 	// System prompt manipulation
 	StripSystemPromptText string
+
+	// Supervisor / request tracking (disabled by default)
+	SupervisorEnabled       bool
+	SupervisorTrackRequests bool
+	SupervisorRecentBuffer  int
+
+	// Supervisor / watchdog timeouts (disabled by default)
+	SupervisorWatchdogEnabled bool
+	SupervisorTTFBTimeout     time.Duration
+	SupervisorStallTimeout    time.Duration
+	SupervisorHardTimeout     time.Duration
+
+	// Supervisor / observability (disabled by default)
+	SupervisorObsEnabled          bool
+	SupervisorObsRequestsEndpoint bool
+	SupervisorObsSSEEndpoint      bool
+	SupervisorObsProgressInterval time.Duration
+
+	// Supervisor / loop detection (disabled by default)
+	SupervisorLoopDetectEnabled   bool
+	SupervisorLoopWindowBytes     int
+	SupervisorLoopNgramBytes      int
+	SupervisorLoopRepeatThreshold int
+	SupervisorLoopMinOutputBytes  int
+
+	// Supervisor / retry (disabled by default)
+	SupervisorRetryEnabled          bool
+	SupervisorRetryMaxAttempts      int
+	SupervisorRetryBackoff          time.Duration
+	SupervisorRetryOnlyNonStreaming bool
+	SupervisorRetryMaxResponseBytes int64
+
+	// Supervisor / restart hook (disabled by default)
+	SupervisorRestartEnabled             bool
+	SupervisorRestartCmd                 string
+	SupervisorRestartCooldown            time.Duration
+	SupervisorRestartMaxPerHour          int
+	SupervisorRestartTriggerConsecTimeouts int
+	SupervisorRestartCmdTimeout          time.Duration
+
+	// Supervisor / metrics (disabled by default)
+	SupervisorMetricsEnabled bool
+	SupervisorMetricsPath    string
+
+	// Supervisor / health check (disabled by default)
+	SupervisorHealthCheckEnabled  bool
+	SupervisorHealthCheckInterval time.Duration
+	SupervisorHealthCheckTimeout  time.Duration
+
+	// Supervisor / output token limiting (disabled by default)
+	SupervisorOutputLimitEnabled  bool
+	SupervisorOutputLimitTokens   int64
+	SupervisorOutputLimitAction   string // "cancel" or "warn"
 }
 
 // Load parses flags/env and returns a validated Config.
@@ -119,6 +172,50 @@ func Load() (Config, error) {
 		LogLevel: getEnvString("LOG_LEVEL", "info"),
 
 		StripSystemPromptText: getEnvString("STRIP_SYSTEM_PROMPT_TEXT", ""),
+
+		SupervisorEnabled:       getEnvBool("SUPERVISOR_ENABLED", false),
+		SupervisorTrackRequests: getEnvBool("SUPERVISOR_TRACK_REQUESTS", false),
+		SupervisorRecentBuffer:  getEnvInt("SUPERVISOR_RECENT_BUFFER", 200),
+
+		SupervisorWatchdogEnabled: getEnvBool("SUPERVISOR_WATCHDOG_ENABLED", false),
+		SupervisorTTFBTimeout:     getEnvDuration("SUPERVISOR_TTFB_TIMEOUT", 120*time.Second),
+		SupervisorStallTimeout:    getEnvDuration("SUPERVISOR_STALL_TIMEOUT", 45*time.Second),
+		SupervisorHardTimeout:     getEnvDuration("SUPERVISOR_HARD_TIMEOUT", 12*time.Minute),
+
+		SupervisorObsEnabled:          getEnvBool("SUPERVISOR_OBS_ENABLED", false),
+		SupervisorObsRequestsEndpoint: getEnvBool("SUPERVISOR_OBS_REQUESTS_ENDPOINT", true),
+		SupervisorObsSSEEndpoint:      getEnvBool("SUPERVISOR_OBS_SSE_ENDPOINT", true),
+		SupervisorObsProgressInterval: getEnvDuration("SUPERVISOR_OBS_PROGRESS_INTERVAL", 250*time.Millisecond),
+
+		SupervisorLoopDetectEnabled:   getEnvBool("SUPERVISOR_LOOP_DETECT_ENABLED", false),
+		SupervisorLoopWindowBytes:     getEnvInt("SUPERVISOR_LOOP_WINDOW_BYTES", 4096),
+		SupervisorLoopNgramBytes:      getEnvInt("SUPERVISOR_LOOP_NGRAM_BYTES", 64),
+		SupervisorLoopRepeatThreshold: getEnvInt("SUPERVISOR_LOOP_REPEAT_THRESHOLD", 3),
+		SupervisorLoopMinOutputBytes:  getEnvInt("SUPERVISOR_LOOP_MIN_OUTPUT_BYTES", 1024),
+
+		SupervisorRetryEnabled:          getEnvBool("SUPERVISOR_RETRY_ENABLED", false),
+		SupervisorRetryMaxAttempts:      getEnvInt("SUPERVISOR_RETRY_MAX_ATTEMPTS", 2),
+		SupervisorRetryBackoff:          getEnvDuration("SUPERVISOR_RETRY_BACKOFF", 250*time.Millisecond),
+		SupervisorRetryOnlyNonStreaming: getEnvBool("SUPERVISOR_RETRY_ONLY_NON_STREAMING", true),
+		SupervisorRetryMaxResponseBytes: getEnvInt64("SUPERVISOR_RETRY_MAX_RESPONSE_BYTES", 8*1024*1024),
+
+		SupervisorRestartEnabled:             getEnvBool("SUPERVISOR_RESTART_ENABLED", false),
+		SupervisorRestartCmd:                 getEnvString("SUPERVISOR_RESTART_CMD", ""),
+		SupervisorRestartCooldown:            getEnvDuration("SUPERVISOR_RESTART_COOLDOWN", 120*time.Second),
+		SupervisorRestartMaxPerHour:          getEnvInt("SUPERVISOR_RESTART_MAX_PER_HOUR", 3),
+		SupervisorRestartTriggerConsecTimeouts: getEnvInt("SUPERVISOR_RESTART_TRIGGER_CONSEC_TIMEOUTS", 2),
+		SupervisorRestartCmdTimeout:          getEnvDuration("SUPERVISOR_RESTART_CMD_TIMEOUT", 30*time.Second),
+
+		SupervisorMetricsEnabled: getEnvBool("SUPERVISOR_METRICS_ENABLED", false),
+		SupervisorMetricsPath:    getEnvString("SUPERVISOR_METRICS_PATH", "/metrics"),
+
+		SupervisorHealthCheckEnabled:  getEnvBool("SUPERVISOR_HEALTH_CHECK_ENABLED", false),
+		SupervisorHealthCheckInterval: getEnvDuration("SUPERVISOR_HEALTH_CHECK_INTERVAL", 30*time.Second),
+		SupervisorHealthCheckTimeout:  getEnvDuration("SUPERVISOR_HEALTH_CHECK_TIMEOUT", 5*time.Second),
+
+		SupervisorOutputLimitEnabled: getEnvBool("SUPERVISOR_OUTPUT_LIMIT_ENABLED", false),
+		SupervisorOutputLimitTokens:  getEnvInt64("SUPERVISOR_OUTPUT_LIMIT_TOKENS", 0),
+		SupervisorOutputLimitAction:   getEnvString("SUPERVISOR_OUTPUT_LIMIT_ACTION", "cancel"),
 	}
 
 	// Flags (override env).
@@ -145,6 +242,41 @@ func Load() (Config, error) {
 	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "flush interval for streaming proxy (env FLUSH_INTERVAL)")
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug|info|warn|error (env LOG_LEVEL)")
 	flag.StringVar(&cfg.StripSystemPromptText, "strip-system-prompt", cfg.StripSystemPromptText, "text to remove from system prompts (env STRIP_SYSTEM_PROMPT_TEXT)")
+	flag.BoolVar(&cfg.SupervisorEnabled, "supervisor-enabled", cfg.SupervisorEnabled, "enable supervisor layer (env SUPERVISOR_ENABLED)")
+	flag.BoolVar(&cfg.SupervisorTrackRequests, "supervisor-track", cfg.SupervisorTrackRequests, "enable request lifecycle tracking (env SUPERVISOR_TRACK_REQUESTS)")
+	flag.IntVar(&cfg.SupervisorRecentBuffer, "supervisor-buffer", cfg.SupervisorRecentBuffer, "maximum recent requests to keep in buffer (env SUPERVISOR_RECENT_BUFFER)")
+	flag.BoolVar(&cfg.SupervisorWatchdogEnabled, "supervisor-watchdog-enabled", cfg.SupervisorWatchdogEnabled, "enable watchdog timeouts (env SUPERVISOR_WATCHDOG_ENABLED)")
+	flag.DurationVar(&cfg.SupervisorTTFBTimeout, "supervisor-ttfb-timeout", cfg.SupervisorTTFBTimeout, "time-to-first-byte timeout (env SUPERVISOR_TTFB_TIMEOUT)")
+	flag.DurationVar(&cfg.SupervisorStallTimeout, "supervisor-stall-timeout", cfg.SupervisorStallTimeout, "stall timeout after first byte (env SUPERVISOR_STALL_TIMEOUT)")
+	flag.DurationVar(&cfg.SupervisorHardTimeout, "supervisor-hard-timeout", cfg.SupervisorHardTimeout, "hard timeout for total request duration (env SUPERVISOR_HARD_TIMEOUT)")
+	flag.BoolVar(&cfg.SupervisorObsEnabled, "supervisor-obs-enabled", cfg.SupervisorObsEnabled, "enable observability endpoints (env SUPERVISOR_OBS_ENABLED)")
+	flag.BoolVar(&cfg.SupervisorObsRequestsEndpoint, "supervisor-obs-requests", cfg.SupervisorObsRequestsEndpoint, "enable /debug/requests endpoint (env SUPERVISOR_OBS_REQUESTS_ENDPOINT)")
+	flag.BoolVar(&cfg.SupervisorObsSSEEndpoint, "supervisor-obs-sse", cfg.SupervisorObsSSEEndpoint, "enable /events SSE endpoint (env SUPERVISOR_OBS_SSE_ENDPOINT)")
+	flag.DurationVar(&cfg.SupervisorObsProgressInterval, "supervisor-obs-progress-interval", cfg.SupervisorObsProgressInterval, "progress event throttling interval (env SUPERVISOR_OBS_PROGRESS_INTERVAL)")
+	flag.BoolVar(&cfg.SupervisorLoopDetectEnabled, "supervisor-loop-detect", cfg.SupervisorLoopDetectEnabled, "enable loop detection (env SUPERVISOR_LOOP_DETECT_ENABLED)")
+	flag.IntVar(&cfg.SupervisorLoopWindowBytes, "supervisor-loop-window", cfg.SupervisorLoopWindowBytes, "loop detection window size in bytes (env SUPERVISOR_LOOP_WINDOW_BYTES)")
+	flag.IntVar(&cfg.SupervisorLoopNgramBytes, "supervisor-loop-ngram", cfg.SupervisorLoopNgramBytes, "loop detection n-gram size in bytes (env SUPERVISOR_LOOP_NGRAM_BYTES)")
+	flag.IntVar(&cfg.SupervisorLoopRepeatThreshold, "supervisor-loop-threshold", cfg.SupervisorLoopRepeatThreshold, "loop detection repeat threshold (env SUPERVISOR_LOOP_REPEAT_THRESHOLD)")
+	flag.IntVar(&cfg.SupervisorLoopMinOutputBytes, "supervisor-loop-min-output", cfg.SupervisorLoopMinOutputBytes, "minimum output before loop detection activates (env SUPERVISOR_LOOP_MIN_OUTPUT_BYTES)")
+	flag.BoolVar(&cfg.SupervisorRetryEnabled, "supervisor-retry-enabled", cfg.SupervisorRetryEnabled, "enable retry logic (env SUPERVISOR_RETRY_ENABLED)")
+	flag.IntVar(&cfg.SupervisorRetryMaxAttempts, "supervisor-retry-attempts", cfg.SupervisorRetryMaxAttempts, "max retry attempts (env SUPERVISOR_RETRY_MAX_ATTEMPTS)")
+	flag.DurationVar(&cfg.SupervisorRetryBackoff, "supervisor-retry-backoff", cfg.SupervisorRetryBackoff, "retry backoff duration (env SUPERVISOR_RETRY_BACKOFF)")
+	flag.BoolVar(&cfg.SupervisorRetryOnlyNonStreaming, "supervisor-retry-non-streaming", cfg.SupervisorRetryOnlyNonStreaming, "only retry non-streaming requests (env SUPERVISOR_RETRY_ONLY_NON_STREAMING)")
+	flag.Int64Var(&cfg.SupervisorRetryMaxResponseBytes, "supervisor-retry-max-response", cfg.SupervisorRetryMaxResponseBytes, "max response bytes to buffer for retry (env SUPERVISOR_RETRY_MAX_RESPONSE_BYTES)")
+	flag.BoolVar(&cfg.SupervisorRestartEnabled, "supervisor-restart-enabled", cfg.SupervisorRestartEnabled, "enable restart hook (env SUPERVISOR_RESTART_ENABLED)")
+	flag.StringVar(&cfg.SupervisorRestartCmd, "supervisor-restart-cmd", cfg.SupervisorRestartCmd, "restart command (env SUPERVISOR_RESTART_CMD)")
+	flag.DurationVar(&cfg.SupervisorRestartCooldown, "supervisor-restart-cooldown", cfg.SupervisorRestartCooldown, "restart cooldown duration (env SUPERVISOR_RESTART_COOLDOWN)")
+	flag.IntVar(&cfg.SupervisorRestartMaxPerHour, "supervisor-restart-max-hour", cfg.SupervisorRestartMaxPerHour, "max restarts per hour (env SUPERVISOR_RESTART_MAX_PER_HOUR)")
+	flag.IntVar(&cfg.SupervisorRestartTriggerConsecTimeouts, "supervisor-restart-trigger", cfg.SupervisorRestartTriggerConsecTimeouts, "consecutive timeouts to trigger restart (env SUPERVISOR_RESTART_TRIGGER_CONSEC_TIMEOUTS)")
+	flag.DurationVar(&cfg.SupervisorRestartCmdTimeout, "supervisor-restart-cmd-timeout", cfg.SupervisorRestartCmdTimeout, "restart command timeout (env SUPERVISOR_RESTART_CMD_TIMEOUT)")
+	flag.BoolVar(&cfg.SupervisorMetricsEnabled, "supervisor-metrics-enabled", cfg.SupervisorMetricsEnabled, "enable Prometheus metrics endpoint (env SUPERVISOR_METRICS_ENABLED)")
+	flag.StringVar(&cfg.SupervisorMetricsPath, "supervisor-metrics-path", cfg.SupervisorMetricsPath, "metrics endpoint path (env SUPERVISOR_METRICS_PATH)")
+	flag.BoolVar(&cfg.SupervisorHealthCheckEnabled, "supervisor-health-check-enabled", cfg.SupervisorHealthCheckEnabled, "enable upstream health checking (env SUPERVISOR_HEALTH_CHECK_ENABLED)")
+	flag.DurationVar(&cfg.SupervisorHealthCheckInterval, "supervisor-health-check-interval", cfg.SupervisorHealthCheckInterval, "health check interval (env SUPERVISOR_HEALTH_CHECK_INTERVAL)")
+	flag.DurationVar(&cfg.SupervisorHealthCheckTimeout, "supervisor-health-check-timeout", cfg.SupervisorHealthCheckTimeout, "health check timeout (env SUPERVISOR_HEALTH_CHECK_TIMEOUT)")
+	flag.BoolVar(&cfg.SupervisorOutputLimitEnabled, "supervisor-output-limit-enabled", cfg.SupervisorOutputLimitEnabled, "enable output token limiting (env SUPERVISOR_OUTPUT_LIMIT_ENABLED)")
+	flag.Int64Var(&cfg.SupervisorOutputLimitTokens, "supervisor-output-limit-tokens", cfg.SupervisorOutputLimitTokens, "maximum output tokens (0 = disabled) (env SUPERVISOR_OUTPUT_LIMIT_TOKENS)")
+	flag.StringVar(&cfg.SupervisorOutputLimitAction, "supervisor-output-limit-action", cfg.SupervisorOutputLimitAction, "action when limit exceeded: cancel or warn (env SUPERVISOR_OUTPUT_LIMIT_ACTION)")
 
 	flag.Parse()
 
@@ -183,6 +315,69 @@ func (c Config) Validate() error {
 	}
 	if c.DefaultOutputBudget > c.MaxOutputBudget {
 		return fmt.Errorf("DEFAULT_OUTPUT_BUDGET must be <= MAX_OUTPUT_BUDGET")
+	}
+	if c.SupervisorRecentBuffer < 0 {
+		return fmt.Errorf("SUPERVISOR_RECENT_BUFFER must be >= 0")
+	}
+	if c.SupervisorTTFBTimeout <= 0 {
+		return fmt.Errorf("SUPERVISOR_TTFB_TIMEOUT must be > 0")
+	}
+	if c.SupervisorStallTimeout <= 0 {
+		return fmt.Errorf("SUPERVISOR_STALL_TIMEOUT must be > 0")
+	}
+	if c.SupervisorHardTimeout <= 0 {
+		return fmt.Errorf("SUPERVISOR_HARD_TIMEOUT must be > 0")
+	}
+	if c.SupervisorObsProgressInterval <= 0 {
+		return fmt.Errorf("SUPERVISOR_OBS_PROGRESS_INTERVAL must be > 0")
+	}
+	if c.SupervisorLoopWindowBytes < 256 {
+		return fmt.Errorf("SUPERVISOR_LOOP_WINDOW_BYTES must be >= 256")
+	}
+	if c.SupervisorLoopNgramBytes < 8 {
+		return fmt.Errorf("SUPERVISOR_LOOP_NGRAM_BYTES must be >= 8")
+	}
+	if c.SupervisorLoopRepeatThreshold < 2 {
+		return fmt.Errorf("SUPERVISOR_LOOP_REPEAT_THRESHOLD must be >= 2")
+	}
+	if c.SupervisorLoopMinOutputBytes < 256 {
+		return fmt.Errorf("SUPERVISOR_LOOP_MIN_OUTPUT_BYTES must be >= 256")
+	}
+	if c.SupervisorRetryMaxAttempts < 1 {
+		return fmt.Errorf("SUPERVISOR_RETRY_MAX_ATTEMPTS must be >= 1")
+	}
+	if c.SupervisorRetryBackoff < 0 {
+		return fmt.Errorf("SUPERVISOR_RETRY_BACKOFF must be >= 0")
+	}
+	if c.SupervisorRetryMaxResponseBytes < 0 {
+		return fmt.Errorf("SUPERVISOR_RETRY_MAX_RESPONSE_BYTES must be >= 0")
+	}
+	if c.SupervisorRestartEnabled && c.SupervisorRestartCmd == "" {
+		return fmt.Errorf("SUPERVISOR_RESTART_CMD is required when SUPERVISOR_RESTART_ENABLED is true")
+	}
+	if c.SupervisorRestartCooldown < 0 {
+		return fmt.Errorf("SUPERVISOR_RESTART_COOLDOWN must be >= 0")
+	}
+	if c.SupervisorRestartMaxPerHour < 1 {
+		return fmt.Errorf("SUPERVISOR_RESTART_MAX_PER_HOUR must be >= 1")
+	}
+	if c.SupervisorRestartTriggerConsecTimeouts < 1 {
+		return fmt.Errorf("SUPERVISOR_RESTART_TRIGGER_CONSEC_TIMEOUTS must be >= 1")
+	}
+	if c.SupervisorRestartCmdTimeout <= 0 {
+		return fmt.Errorf("SUPERVISOR_RESTART_CMD_TIMEOUT must be > 0")
+	}
+	if c.SupervisorHealthCheckInterval <= 0 {
+		return fmt.Errorf("SUPERVISOR_HEALTH_CHECK_INTERVAL must be > 0")
+	}
+	if c.SupervisorHealthCheckTimeout <= 0 {
+		return fmt.Errorf("SUPERVISOR_HEALTH_CHECK_TIMEOUT must be > 0")
+	}
+	if c.SupervisorOutputLimitTokens < 0 {
+		return fmt.Errorf("SUPERVISOR_OUTPUT_LIMIT_TOKENS must be >= 0")
+	}
+	if c.SupervisorOutputLimitAction != "cancel" && c.SupervisorOutputLimitAction != "warn" {
+		return fmt.Errorf("SUPERVISOR_OUTPUT_LIMIT_ACTION must be 'cancel' or 'warn'")
 	}
 	switch c.OverrideNumCtx {
 	case OverrideAlways, OverrideIfMissing, OverrideIfTooSmall:

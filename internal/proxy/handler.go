@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,21 +11,27 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"ollama-auto-ctx/internal/calibration"
 	"ollama-auto-ctx/internal/config"
 	"ollama-auto-ctx/internal/estimate"
 	"ollama-auto-ctx/internal/ollama"
+	"ollama-auto-ctx/internal/supervisor"
 	"ollama-auto-ctx/internal/util"
 )
 
 type ctxKey string
 
 const (
-	ctxSampleKey   ctxKey = "sample"
-	ctxDecisionKey ctxKey = "decision"
-	ctxClampedKey  ctxKey = "clamped"
+	ctxSampleKey      ctxKey = "sample"
+	ctxDecisionKey    ctxKey = "decision"
+	ctxClampedKey     ctxKey = "clamped"
+	ctxRequestIDKey   ctxKey = "request_id"
+	ctxCancelFuncKey  ctxKey = "cancel_func"
 )
 
 // Decision captures how the proxy chose a context size.
@@ -51,11 +58,19 @@ type Decision struct {
 // Handler is an http.Handler that proxies to Ollama and injects options.num_ctx
 // for /api/chat and /api/generate.
 type Handler struct {
-	cfg       config.Config
-	logger    *slog.Logger
-	proxy     *httputil.ReverseProxy
-	showCache *ollama.ShowCache
-	calib     *calibration.Store
+	cfg          config.Config
+	logger       *slog.Logger
+	proxy        *httputil.ReverseProxy
+	showCache    *ollama.ShowCache
+	calib        *calibration.Store
+	tracker      *supervisor.Tracker
+	watchdog     *supervisor.Watchdog
+	eventBus     *supervisor.EventBus
+	retryer      *supervisor.Retryer
+	metrics      *supervisor.Metrics
+	healthChecker *supervisor.HealthChecker
+	upstream     *url.URL
+	nextID       int64 // atomic counter for request IDs
 }
 
 func (h *Handler) modifyResponse(resp *http.Response) error {
@@ -74,21 +89,81 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	}
 
 	ct := resp.Header.Get("Content-Type")
-	resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes, sample, h.calib, h.logger)
+	// Get request ID from context
+	reqID := ""
+	if reqIDVal := resp.Request.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+		if id, ok := reqIDVal.(string); ok {
+			reqID = id
+		}
+	}
+
+	// Create loop detector if enabled and we have a cancel function
+	var loopDetector *supervisor.LoopDetector
+	var cancelFunc func()
+	if h.cfg.SupervisorLoopDetectEnabled {
+		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
+			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
+				cancelFunc = cancel
+				loopDetector = supervisor.NewLoopDetector(
+					supervisor.LoopDetectorConfig{
+						WindowBytes:     h.cfg.SupervisorLoopWindowBytes,
+						NgramBytes:      h.cfg.SupervisorLoopNgramBytes,
+						RepeatThreshold: h.cfg.SupervisorLoopRepeatThreshold,
+						MinOutputBytes:  h.cfg.SupervisorLoopMinOutputBytes,
+					},
+					reqID,
+					cancel,
+					h.tracker,
+				)
+			}
+		}
+	}
+
+	// Get cancel function for output limit if not already set
+	if cancelFunc == nil {
+		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
+			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
+				cancelFunc = cancel
+			}
+		}
+	}
+
+	// Determine output limit parameters
+	var outputTokenLimit int64
+	var outputLimitAction string
+	var minOutputBytes int64
+	if h.cfg.SupervisorOutputLimitEnabled && h.cfg.SupervisorOutputLimitTokens > 0 {
+		outputTokenLimit = int64(h.cfg.SupervisorOutputLimitTokens)
+		outputLimitAction = h.cfg.SupervisorOutputLimitAction
+		// Use same minimum as loop detection for consistency
+		minOutputBytes = int64(h.cfg.SupervisorLoopMinOutputBytes)
+		if minOutputBytes < 256 {
+			minOutputBytes = 256 // Minimum enforced by loop detector
+		}
+	}
+
+	resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes, sample, h.calib, h.tracker, loopDetector, reqID, h.logger, outputTokenLimit, outputLimitAction, cancelFunc, minOutputBytes)
 	return nil
 }
 
 // NewHandler constructs the proxy handler.
-func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCache, calib *calibration.Store, logger *slog.Logger) *Handler {
+func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCache, calib *calibration.Store, tracker *supervisor.Tracker, watchdog *supervisor.Watchdog, eventBus *supervisor.EventBus, retryer *supervisor.Retryer, metrics *supervisor.Metrics, healthChecker *supervisor.HealthChecker, logger *slog.Logger) *Handler {
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 	rp.FlushInterval = cfg.FlushInterval
 
 	h := &Handler{
-		cfg:       cfg,
-		logger:    logger,
-		proxy:     rp,
-		showCache: showCache,
-		calib:     calib,
+		cfg:          cfg,
+		upstream:     upstream,
+		logger:       logger,
+		proxy:        rp,
+		showCache:    showCache,
+		calib:        calib,
+		tracker:      tracker,
+		watchdog:     watchdog,
+		eventBus:     eventBus,
+		retryer:      retryer,
+		metrics:      metrics,
+		healthChecker: healthChecker,
 	}
 
 	// Tap responses for calibration and add headers without buffering streams.
@@ -96,6 +171,19 @@ func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCach
 
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		logger.Error("upstream proxy error", "err", err, "path", r.URL.Path)
+
+		// Mark request as failed and stop watchdog if tracking is enabled
+		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+			if reqID, ok := reqIDVal.(string); ok {
+				if h.tracker != nil {
+					h.tracker.Finish(reqID, supervisor.StatusUpstreamError, err)
+				}
+				if h.watchdog != nil {
+					h.watchdog.Stop(reqID)
+				}
+			}
+		}
+
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("bad gateway"))
 	}
@@ -105,11 +193,81 @@ func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCach
 
 // ServeHTTP implements the proxy + rewrite logic.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Basic health endpoint that does not touch upstream.
-	if r.URL.Path == "/healthz" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+	// Metrics endpoint
+	if h.cfg.SupervisorMetricsEnabled && r.URL.Path == h.cfg.SupervisorMetricsPath && r.Method == http.MethodGet {
+		h.handleMetrics(w, r)
 		return
+	}
+
+	// Health endpoints
+	if r.URL.Path == "/healthz" {
+		h.handleHealthz(w, r)
+		return
+	}
+	if r.URL.Path == "/healthz/upstream" {
+		h.handleHealthzUpstream(w, r)
+		return
+	}
+
+	// Generate request ID for tracking
+	reqID := h.generateRequestID()
+
+	// Build context chain: start with request context, add request ID, optionally add cancellation
+	ctx := r.Context()
+	ctx = context.WithValue(ctx, ctxRequestIDKey, reqID)
+
+	// Track if request was already finished (by watchdog timeout or error handler)
+	var alreadyFinished bool
+
+	// Start tracking if enabled
+	if h.tracker != nil {
+		endpoint := ""
+		if r.Method == http.MethodPost && r.URL.Path == "/api/chat" {
+			endpoint = estimate.EndpointChat
+		} else if r.Method == http.MethodPost && r.URL.Path == "/api/generate" {
+			endpoint = estimate.EndpointGenerate
+		}
+
+		stream := r.URL.Query().Get("stream") == "true"
+		h.tracker.Start(reqID, endpoint, "", stream) // model will be determined later
+
+		// Ensure request is marked as finished on all exit paths (unless already finished)
+		defer func() {
+			if !alreadyFinished && h.tracker.GetRequestInfo(reqID) != nil {
+				h.tracker.Finish(reqID, supervisor.StatusSuccess, nil)
+			}
+		}()
+	}
+
+	// Set up context cancellation for watchdog and/or loop detection
+	var cancel context.CancelFunc
+	needsCancel := h.watchdog != nil || h.cfg.SupervisorLoopDetectEnabled
+	if needsCancel {
+		ctx, cancel = context.WithCancel(ctx)
+		// Store cancel func in context for loop detector to use
+		ctx = context.WithValue(ctx, ctxCancelFuncKey, cancel)
+
+		if h.watchdog != nil {
+			h.watchdog.Start(reqID, cancel)
+			// Ensure watchdog stops monitoring when request finishes
+			defer h.watchdog.Stop(reqID)
+		}
+	}
+
+	// Apply the complete context to the request
+	*r = *r.WithContext(ctx)
+	_ = cancel // silence unused warning when cancel is nil
+
+	// Observability endpoints (before proxy delegation)
+	if h.cfg.SupervisorObsEnabled {
+		if r.URL.Path == "/debug/requests" && h.cfg.SupervisorObsRequestsEndpoint && r.Method == http.MethodGet {
+			h.handleDebugRequests(w, r)
+			return
+		}
+		if r.URL.Path == "/events" && h.cfg.SupervisorObsSSEEndpoint && r.Method == http.MethodGet {
+			h.handleSSEEvents(w, r)
+			return
+		}
 	}
 
 	// Simple CORS support (can be disabled by setting CORS_ALLOW_ORIGIN="").
@@ -188,6 +346,15 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 	}
 	if features.Model == "" {
 		return
+	}
+
+	// Update tracker with model information if tracking is enabled
+	if h.tracker != nil {
+		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+			if reqID, ok := reqIDVal.(string); ok {
+				h.tracker.UpdateModel(reqID, features.Model)
+			}
+		}
 	}
 
 	// Fetch model limits (cached). If this fails, we fall back to config max.
@@ -396,4 +563,167 @@ func setBody(r *http.Request, b []byte) {
 
 func intToString(n int) string {
 	return strconv.Itoa(n)
+}
+
+// generateRequestID generates a unique request ID using an atomic counter.
+func (h *Handler) generateRequestID() string {
+	id := atomic.AddInt64(&h.nextID, 1)
+	return strconv.FormatInt(id, 10)
+}
+
+// handleDebugRequests returns the current state of in-flight and recent requests.
+func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
+	if h.tracker == nil {
+		http.Error(w, "tracker not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	snapshot := h.tracker.Snapshot()
+
+	// Enrich with estimated output tokens
+	type EnrichedRequestInfo struct {
+		supervisor.RequestInfo
+		EstimatedOutputTokens int64 `json:"estimated_output_tokens"`
+	}
+
+	type Response struct {
+		InFlight map[string]EnrichedRequestInfo `json:"in_flight"`
+		Recent   []EnrichedRequestInfo          `json:"recent"`
+	}
+
+	resp := Response{
+		InFlight: make(map[string]EnrichedRequestInfo, len(snapshot.InFlight)),
+		Recent:   make([]EnrichedRequestInfo, 0, len(snapshot.Recent)),
+	}
+
+	// Enrich in-flight requests
+	for id, req := range snapshot.InFlight {
+		estTokens := supervisor.EstimateOutputTokens(req.BytesForwarded, req.Model, h.calib, h.cfg.DefaultTokensPerByte)
+		resp.InFlight[id] = EnrichedRequestInfo{
+			RequestInfo:           req,
+			EstimatedOutputTokens: estTokens,
+		}
+	}
+
+	// Enrich recent requests
+	for _, req := range snapshot.Recent {
+		estTokens := supervisor.EstimateOutputTokens(req.BytesForwarded, req.Model, h.calib, h.cfg.DefaultTokensPerByte)
+		resp.Recent = append(resp.Recent, EnrichedRequestInfo{
+			RequestInfo:           req,
+			EstimatedOutputTokens: estTokens,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.logger.Error("failed to encode debug requests response", "err", err)
+	}
+}
+
+// handleSSEEvents streams Server-Sent Events for real-time request monitoring.
+func (h *Handler) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
+	if h.eventBus == nil {
+		http.Error(w, "event bus not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	if h.cfg.CORSAllowOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", h.cfg.CORSAllowOrigin)
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Subscribe to event bus
+	eventCh := h.eventBus.Subscribe()
+	defer h.eventBus.Unsubscribe(eventCh)
+
+	// Send initial state marker (SSE comment)
+	_, _ = w.Write([]byte(": connected\n\n"))
+	flusher.Flush()
+
+	// Stream events
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			// Client disconnected
+			return
+		case event, ok := <-eventCh:
+			if !ok {
+				// Channel closed
+				return
+			}
+			sseData, err := supervisor.FormatSSEEvent(event)
+			if err != nil {
+				h.logger.Error("failed to format SSE event", "err", err)
+				continue
+			}
+			if _, err := w.Write([]byte(sseData)); err != nil {
+				// Client disconnected
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// handleMetrics serves Prometheus metrics.
+func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.metrics == nil {
+		http.Error(w, "metrics not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Use Prometheus handler to serve metrics
+	promhttp.Handler().ServeHTTP(w, r)
+}
+
+// handleHealthz serves the combined proxy + upstream health check.
+func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	// Check upstream health if health checker is enabled
+	if h.healthChecker != nil && !h.healthChecker.Healthy() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("upstream unhealthy"))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleHealthzUpstream serves upstream-only health status with details.
+func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) {
+	if h.healthChecker == nil {
+		http.Error(w, "health check not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	healthy := h.healthChecker.Healthy()
+	lastCheck := h.healthChecker.LastCheck()
+	lastError := h.healthChecker.LastError()
+
+	w.Header().Set("Content-Type", "application/json")
+	if healthy {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	response := map[string]interface{}{
+		"healthy":   healthy,
+		"last_check": lastCheck.Format(time.RFC3339),
+	}
+	if lastError != "" {
+		response["last_error"] = lastError
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
