@@ -34,6 +34,13 @@ type RequestInfo struct {
 	BytesForwarded        int64         `json:"bytes_forwarded"`
 	Status                RequestStatus `json:"status,omitempty"`
 	Error                 string        `json:"error,omitempty"`
+	// Context sizing information
+	EstimatedPromptTokens int `json:"estimated_prompt_tokens,omitempty"`
+	ChosenCtx              int `json:"chosen_ctx,omitempty"`
+	OutputBudgetTokens     int `json:"output_budget_tokens,omitempty"`
+	// Actual token counts from Ollama (if available)
+	PromptEvalCount int `json:"prompt_eval_count,omitempty"` // Actual input tokens
+	EvalCount       int `json:"eval_count,omitempty"`         // Actual output tokens
 	// internal: last time a progress event was published (not exported in JSON)
 	lastProgressEventTime time.Time
 	// internal: whether output limit was exceeded (for warn mode)
@@ -116,6 +123,33 @@ func (t *Tracker) UpdateModel(reqID string, model string) {
 
 	if req, exists := t.inFlight[reqID]; exists {
 		req.Model = model
+	}
+}
+
+// UpdateContextData updates context sizing information for a request.
+func (t *Tracker) UpdateContextData(reqID string, estimatedPromptTokens, chosenCtx, outputBudgetTokens int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if req, exists := t.inFlight[reqID]; exists {
+		req.EstimatedPromptTokens = estimatedPromptTokens
+		req.ChosenCtx = chosenCtx
+		req.OutputBudgetTokens = outputBudgetTokens
+	}
+}
+
+// UpdateTokenCounts updates actual token counts from Ollama response.
+func (t *Tracker) UpdateTokenCounts(reqID string, promptEvalCount, evalCount int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if req, exists := t.inFlight[reqID]; exists {
+		if promptEvalCount > 0 {
+			req.PromptEvalCount = promptEvalCount
+		}
+		if evalCount > 0 {
+			req.EvalCount = evalCount
+		}
 	}
 }
 

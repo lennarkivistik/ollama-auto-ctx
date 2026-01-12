@@ -134,12 +134,13 @@ Cancels requests that exceed timeout thresholds. Prevents indefinitely hanging r
 | Variable | Flag | Default | Description |
 |----------|------|---------|-------------|
 | `SUPERVISOR_WATCHDOG_ENABLED` | `--supervisor-watchdog-enabled` | `false` | Enable watchdog |
-| `SUPERVISOR_TTFB_TIMEOUT` | `--supervisor-ttfb-timeout` | `120s` | Time-to-first-byte timeout |
-| `SUPERVISOR_STALL_TIMEOUT` | `--supervisor-stall-timeout` | `45s` | Stall timeout (no activity after first byte) |
+| `SUPERVISOR_TTFB_TIMEOUT` | `--supervisor-ttfb-timeout` | `300s` | Time-to-first-byte timeout |
+| `SUPERVISOR_STALL_TIMEOUT` | `--supervisor-stall-timeout` | `200s` | Stall timeout (no activity after first byte) |
 | `SUPERVISOR_HARD_TIMEOUT` | `--supervisor-hard-timeout` | `12m` | Total request duration limit |
 
 **Recommended values:**
-- Interactive chat: `30s` / `15s` / `5m`
+- **Consumer hardware / Local models** (default): `300s` / `200s` / `12m` - Higher timeouts for slower consumer hardware with large contexts
+- Interactive chat (enterprise): `30s` / `15s` / `5m`
 - Batch processing: `120s` / `60s` / `30m`
 
 ### Loop Detection

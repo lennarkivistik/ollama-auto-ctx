@@ -257,19 +257,31 @@ func (t *TapReadCloser) tryParseJSON(line []byte) {
 	if err := dec.Decode(&m); err != nil {
 		return
 	}
-	v, ok := m["prompt_eval_count"]
-	if !ok {
-		return
-	}
-	n, ok := util.ToInt(v)
-	if !ok || n <= 0 {
-		return
+
+	// Extract prompt_eval_count (input tokens)
+	var promptEvalCount int
+	if v, ok := m["prompt_eval_count"]; ok {
+		if n, ok := util.ToInt(v); ok && n > 0 {
+			promptEvalCount = n
+			t.store.Update(t.sample, calibration.Observed{PromptEvalCount: n})
+			t.observed = true
+			if t.logger != nil {
+				t.logger.Debug("calibration observation", "model", t.sample.Model, "prompt_eval_count", n)
+			}
+		}
 	}
 
-	t.store.Update(t.sample, calibration.Observed{PromptEvalCount: n})
-	t.observed = true
-	if t.logger != nil {
-		t.logger.Debug("calibration observation", "model", t.sample.Model, "prompt_eval_count", n)
+	// Extract eval_count (output tokens)
+	var evalCount int
+	if v, ok := m["eval_count"]; ok {
+		if n, ok := util.ToInt(v); ok && n > 0 {
+			evalCount = n
+		}
+	}
+
+	// Update tracker with token counts if available
+	if (promptEvalCount > 0 || evalCount > 0) && t.tracker != nil && t.requestID != "" {
+		t.tracker.UpdateTokenCounts(t.requestID, promptEvalCount, evalCount)
 	}
 }
 

@@ -178,8 +178,8 @@ func Load() (Config, error) {
 		SupervisorRecentBuffer:  getEnvInt("SUPERVISOR_RECENT_BUFFER", 200),
 
 		SupervisorWatchdogEnabled: getEnvBool("SUPERVISOR_WATCHDOG_ENABLED", false),
-		SupervisorTTFBTimeout:     getEnvDuration("SUPERVISOR_TTFB_TIMEOUT", 120*time.Second),
-		SupervisorStallTimeout:    getEnvDuration("SUPERVISOR_STALL_TIMEOUT", 45*time.Second),
+		SupervisorTTFBTimeout:     getEnvDuration("SUPERVISOR_TTFB_TIMEOUT", 300*time.Second),
+		SupervisorStallTimeout:    getEnvDuration("SUPERVISOR_STALL_TIMEOUT", 200*time.Second),
 		SupervisorHardTimeout:     getEnvDuration("SUPERVISOR_HARD_TIMEOUT", 12*time.Minute),
 
 		SupervisorObsEnabled:          getEnvBool("SUPERVISOR_OBS_ENABLED", false),

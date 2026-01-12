@@ -215,22 +215,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate request ID for tracking
-	reqID := h.generateRequestID()
+	// Observability endpoints (before tracking to avoid feedback loop)
+	if h.cfg.SupervisorObsEnabled {
+		if r.URL.Path == "/debug/requests" && h.cfg.SupervisorObsRequestsEndpoint && r.Method == http.MethodGet {
+			h.handleDebugRequests(w, r)
+			return
+		}
+		if r.URL.Path == "/events" && h.cfg.SupervisorObsSSEEndpoint && r.Method == http.MethodGet {
+			h.handleSSEEvents(w, r)
+			return
+		}
+		if r.URL.Path == "/config" && h.cfg.SupervisorObsEnabled && r.Method == http.MethodGet {
+			h.handleConfig(w, r)
+			return
+		}
+	}
+
+	// Only track Ollama API endpoints (/api/chat and /api/generate)
+	// Skip tracking for observability, health, metrics, and dashboard endpoints
+	isOllamaEndpoint := (r.Method == http.MethodPost && r.URL.Path == "/api/chat") ||
+		(r.Method == http.MethodPost && r.URL.Path == "/api/generate")
+
+	// Generate request ID for tracking (only for Ollama endpoints)
+	var reqID string
+	if isOllamaEndpoint {
+		reqID = h.generateRequestID()
+	}
 
 	// Build context chain: start with request context, add request ID, optionally add cancellation
 	ctx := r.Context()
-	ctx = context.WithValue(ctx, ctxRequestIDKey, reqID)
+	if isOllamaEndpoint {
+		ctx = context.WithValue(ctx, ctxRequestIDKey, reqID)
+	}
 
 	// Track if request was already finished (by watchdog timeout or error handler)
 	var alreadyFinished bool
 
-	// Start tracking if enabled
-	if h.tracker != nil {
+	// Start tracking if enabled and this is an Ollama endpoint
+	if h.tracker != nil && isOllamaEndpoint {
 		endpoint := ""
-		if r.Method == http.MethodPost && r.URL.Path == "/api/chat" {
+		if r.URL.Path == "/api/chat" {
 			endpoint = estimate.EndpointChat
-		} else if r.Method == http.MethodPost && r.URL.Path == "/api/generate" {
+		} else if r.URL.Path == "/api/generate" {
 			endpoint = estimate.EndpointGenerate
 		}
 
@@ -245,9 +271,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Set up context cancellation for watchdog and/or loop detection
+	// Set up context cancellation for watchdog and/or loop detection (only for Ollama endpoints)
 	var cancel context.CancelFunc
-	needsCancel := h.watchdog != nil || h.cfg.SupervisorLoopDetectEnabled
+	needsCancel := isOllamaEndpoint && (h.watchdog != nil || h.cfg.SupervisorLoopDetectEnabled)
 	if needsCancel {
 		ctx, cancel = context.WithCancel(ctx)
 		// Store cancel func in context for loop detector to use
@@ -263,18 +289,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Apply the complete context to the request
 	*r = *r.WithContext(ctx)
 	_ = cancel // silence unused warning when cancel is nil
-
-	// Observability endpoints (before proxy delegation)
-	if h.cfg.SupervisorObsEnabled {
-		if r.URL.Path == "/debug/requests" && h.cfg.SupervisorObsRequestsEndpoint && r.Method == http.MethodGet {
-			h.handleDebugRequests(w, r)
-			return
-		}
-		if r.URL.Path == "/events" && h.cfg.SupervisorObsSSEEndpoint && r.Method == http.MethodGet {
-			h.handleSSEEvents(w, r)
-			return
-		}
-	}
 
 	// Simple CORS support (can be disabled by setting CORS_ALLOW_ORIGIN="").
 	if h.cfg.CORSAllowOrigin != "" {
@@ -497,6 +511,15 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		ctx2 = context.WithValue(ctx2, ctxClampedKey, true)
 	}
 	*r = *r.WithContext(ctx2)
+
+	// Update tracker with context sizing information
+	if h.tracker != nil {
+		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+			if reqID, ok := reqIDVal.(string); ok {
+				h.tracker.UpdateContextData(reqID, dec.EstimatedPromptTokens, dec.ChosenCtx, dec.OutputBudgetTokens)
+			}
+		}
+	}
 
 	// Structured log for the decision.
 	h.logger.Info("ctx decision",
@@ -739,4 +762,111 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(dashboardHTML))
+}
+
+// handleConfig returns the current configuration as JSON.
+func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Create a map with all config values
+	config := map[string]interface{}{
+		"listen_addr":  h.cfg.ListenAddr,
+		"upstream_url": h.cfg.UpstreamURL,
+		
+		// Context window
+		"min_ctx":   h.cfg.MinCtx,
+		"max_ctx":   h.cfg.MaxCtx,
+		"buckets":   h.cfg.Buckets,
+		"headroom":  h.cfg.Headroom,
+		
+		// Output token budgeting
+		"default_output_budget":         h.cfg.DefaultOutputBudget,
+		"max_output_budget":            h.cfg.MaxOutputBudget,
+		"structured_overhead":          h.cfg.StructuredOverhead,
+		"dynamic_default_output_budget": h.cfg.DynamicDefaultOutputBudget,
+		
+		// Estimation defaults
+		"default_fixed_overhead_tokens":    h.cfg.DefaultFixedOverheadTokens,
+		"default_per_message_overhead":     h.cfg.DefaultPerMessageOverhead,
+		"default_tokens_per_byte":          h.cfg.DefaultTokensPerByte,
+		"default_tokens_per_image_fallback": h.cfg.DefaultTokensPerImageFallback,
+		
+		// Override policy
+		"override_num_ctx": string(h.cfg.OverrideNumCtx),
+		
+		// Safety + performance
+		"request_body_max_bytes": h.cfg.RequestBodyMaxBytes,
+		"response_tap_max_bytes": h.cfg.ResponseTapMaxBytes,
+		"show_cache_ttl":         h.cfg.ShowCacheTTL.String(),
+		"calibration_enabled":    h.cfg.CalibrationEnabled,
+		"calibration_file":       h.cfg.CalibrationFile,
+		"hardware_probe":         h.cfg.HardwareProbe,
+		"hardware_probe_refresh":  h.cfg.HardwareProbeRefresh.String(),
+		"hardware_probe_vram_headroom": h.cfg.HardwareProbeVramHeadroom,
+		
+		// HTTP
+		"cors_allow_origin": h.cfg.CORSAllowOrigin,
+		"flush_interval":     h.cfg.FlushInterval.String(),
+		
+		// Logging
+		"log_level": h.cfg.LogLevel,
+		
+		// System prompt
+		"strip_system_prompt_text": h.cfg.StripSystemPromptText,
+		
+		// Supervisor
+		"supervisor_enabled":        h.cfg.SupervisorEnabled,
+		"supervisor_track_requests": h.cfg.SupervisorTrackRequests,
+		"supervisor_recent_buffer":   h.cfg.SupervisorRecentBuffer,
+		
+		// Supervisor watchdog
+		"supervisor_watchdog_enabled": h.cfg.SupervisorWatchdogEnabled,
+		"supervisor_ttfb_timeout":     h.cfg.SupervisorTTFBTimeout.String(),
+		"supervisor_stall_timeout":     h.cfg.SupervisorStallTimeout.String(),
+		"supervisor_hard_timeout":     h.cfg.SupervisorHardTimeout.String(),
+		
+		// Supervisor observability
+		"supervisor_obs_enabled":           h.cfg.SupervisorObsEnabled,
+		"supervisor_obs_requests_endpoint": h.cfg.SupervisorObsRequestsEndpoint,
+		"supervisor_obs_sse_endpoint":       h.cfg.SupervisorObsSSEEndpoint,
+		"supervisor_obs_progress_interval":  h.cfg.SupervisorObsProgressInterval.String(),
+		
+		// Supervisor loop detection
+		"supervisor_loop_detect_enabled":    h.cfg.SupervisorLoopDetectEnabled,
+		"supervisor_loop_window_bytes":      h.cfg.SupervisorLoopWindowBytes,
+		"supervisor_loop_ngram_bytes":      h.cfg.SupervisorLoopNgramBytes,
+		"supervisor_loop_repeat_threshold":  h.cfg.SupervisorLoopRepeatThreshold,
+		"supervisor_loop_min_output_bytes":  h.cfg.SupervisorLoopMinOutputBytes,
+		
+		// Supervisor retry
+		"supervisor_retry_enabled":              h.cfg.SupervisorRetryEnabled,
+		"supervisor_retry_max_attempts":         h.cfg.SupervisorRetryMaxAttempts,
+		"supervisor_retry_backoff":              h.cfg.SupervisorRetryBackoff.String(),
+		"supervisor_retry_only_non_streaming":    h.cfg.SupervisorRetryOnlyNonStreaming,
+		"supervisor_retry_max_response_bytes":   h.cfg.SupervisorRetryMaxResponseBytes,
+		
+		// Supervisor restart
+		"supervisor_restart_enabled":                  h.cfg.SupervisorRestartEnabled,
+		"supervisor_restart_cmd":                      h.cfg.SupervisorRestartCmd,
+		"supervisor_restart_cooldown":                 h.cfg.SupervisorRestartCooldown.String(),
+		"supervisor_restart_max_per_hour":             h.cfg.SupervisorRestartMaxPerHour,
+		"supervisor_restart_trigger_consec_timeouts":  h.cfg.SupervisorRestartTriggerConsecTimeouts,
+		"supervisor_restart_cmd_timeout":              h.cfg.SupervisorRestartCmdTimeout.String(),
+		
+		// Supervisor metrics
+		"supervisor_metrics_enabled": h.cfg.SupervisorMetricsEnabled,
+		"supervisor_metrics_path":    h.cfg.SupervisorMetricsPath,
+		
+		// Supervisor health check
+		"supervisor_health_check_enabled":  h.cfg.SupervisorHealthCheckEnabled,
+		"supervisor_health_check_interval": h.cfg.SupervisorHealthCheckInterval.String(),
+		"supervisor_health_check_timeout":   h.cfg.SupervisorHealthCheckTimeout.String(),
+		
+		// Supervisor output safety limit
+		"supervisor_output_safety_limit_enabled": h.cfg.SupervisorOutputSafetyLimitEnabled,
+		"supervisor_output_safety_limit_tokens":  h.cfg.SupervisorOutputSafetyLimitTokens,
+		"supervisor_output_safety_limit_action":  h.cfg.SupervisorOutputSafetyLimitAction,
+	}
+	
+	json.NewEncoder(w).Encode(config)
 }
