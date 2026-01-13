@@ -1,3 +1,5 @@
+//go:build cgo && !mips64 && !mips64le && !ppc64 && !s390x
+
 package storage
 
 import (
@@ -10,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // CGO-based SQLite driver
 )
 
 const schema = `

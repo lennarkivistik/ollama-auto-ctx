@@ -100,7 +100,7 @@ All configuration is via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STORAGE` | `sqlite` | sqlite / memory / off |
+| `STORAGE` | `sqlite` | sqlite / memory / off (auto-falls back to memory on unsupported platforms) |
 | `STORAGE_PATH` | `/data/oac.sqlite` | SQLite database file path |
 | `STORAGE_MAX_ROWS` | `3000` | Maximum rows before pruning |
 

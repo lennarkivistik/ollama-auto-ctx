@@ -582,7 +582,7 @@ MODE=retry
 LISTEN_ADDR=$LISTEN_ADDR
 UPSTREAM_URL=$UPSTREAM_URL
 
-# Storage
+# Storage: sqlite (default, falls back to memory if not supported), memory, off
 STORAGE=sqlite
 STORAGE_PATH=$DATA_DIR/oac.sqlite
 STORAGE_MAX_ROWS=3000

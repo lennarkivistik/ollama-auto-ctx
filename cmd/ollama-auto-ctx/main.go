@@ -55,11 +55,18 @@ func main() {
 		case config.StorageSQLite:
 			store, err = storage.NewSQLiteStore(cfg.StoragePath, cfg.StorageMaxRows, logger)
 			if err != nil {
-				logger.Error("failed to create sqlite store, falling back to memory", "err", err)
+				logger.Warn("SQLite storage not available, falling back to memory", "err", err)
 				store = storage.NewMemoryStore(cfg.StorageMaxRows)
 			}
 		case config.StorageMemory:
 			store = storage.NewMemoryStore(cfg.StorageMaxRows)
+		default:
+			// Auto-detect: try SQLite first, fall back to memory
+			store, err = storage.NewSQLiteStore(cfg.StoragePath, cfg.StorageMaxRows, logger)
+			if err != nil {
+				logger.Debug("SQLite not available, using memory storage", "err", err)
+				store = storage.NewMemoryStore(cfg.StorageMaxRows)
+			}
 		}
 		if store != nil {
 			defer store.Close()
