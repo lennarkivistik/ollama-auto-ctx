@@ -16,10 +16,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"ollama-auto-ctx/internal/api"
 	"ollama-auto-ctx/internal/calibration"
 	"ollama-auto-ctx/internal/config"
 	"ollama-auto-ctx/internal/estimate"
 	"ollama-auto-ctx/internal/ollama"
+	"ollama-auto-ctx/internal/storage"
 	"ollama-auto-ctx/internal/supervisor"
 	"ollama-auto-ctx/internal/util"
 )
@@ -27,152 +29,97 @@ import (
 type ctxKey string
 
 const (
-	ctxSampleKey      ctxKey = "sample"
-	ctxDecisionKey    ctxKey = "decision"
-	ctxClampedKey     ctxKey = "clamped"
-	ctxRequestIDKey   ctxKey = "request_id"
-	ctxCancelFuncKey  ctxKey = "cancel_func"
+	ctxSampleKey     ctxKey = "sample"
+	ctxDecisionKey   ctxKey = "decision"
+	ctxClampedKey    ctxKey = "clamped"
+	ctxRequestIDKey  ctxKey = "request_id"
+	ctxCancelFuncKey ctxKey = "cancel_func"
+	ctxMetadataKey   ctxKey = "metadata"
 )
 
 // Decision captures how the proxy chose a context size.
-// It is stored in request context for logging and for response headers.
 type Decision struct {
-	Model                string
-	Endpoint             string
+	Model                 string
+	Endpoint              string
 	EstimatedPromptTokens int
-	OutputBudgetTokens   int
-	OutputBudgetSource   string // "explicit_num_predict", "dynamic_default", or "fixed_default"
-	NeededTokens         int
-	NeededWithHeadroom   int
-	ChosenCtx            int
-	UserCtx              int
-	UserCtxProvided      bool
-	OverrideApplied      bool
-	Clamped              bool
-	MaxConfigCtx         int
-	MaxModelCtx          int
-	MaxSafeCtx           int
-	ThinkVerdict         string
+	OutputBudgetTokens    int
+	OutputBudgetSource    string
+	NeededTokens          int
+	NeededWithHeadroom    int
+	ChosenCtx             int
+	UserCtx               int
+	UserCtxProvided       bool
+	OverrideApplied       bool
+	Clamped               bool
+	MaxConfigCtx          int
+	MaxModelCtx           int
+	MaxSafeCtx            int
+	ThinkVerdict          string
 }
 
-// Handler is an http.Handler that proxies to Ollama and injects options.num_ctx
-// for /api/chat and /api/generate.
+// Handler is an http.Handler that proxies to Ollama and injects options.num_ctx.
 type Handler struct {
-	cfg          config.Config
-	logger       *slog.Logger
-	proxy        *httputil.ReverseProxy
-	showCache    *ollama.ShowCache
-	calib        *calibration.Store
-	tracker      *supervisor.Tracker
-	watchdog     *supervisor.Watchdog
-	eventBus     *supervisor.EventBus
-	retryer      *supervisor.Retryer
-	metrics      *supervisor.Metrics
+	cfg           config.Config
+	features      config.Features
+	logger        *slog.Logger
+	proxy         *httputil.ReverseProxy
+	showCache     *ollama.ShowCache
+	calib         *calibration.Store
+	store         storage.Store
+	apiServer     *api.Server
+	tracker       *supervisor.Tracker
+	watchdog      *supervisor.Watchdog
+	eventBus      *supervisor.EventBus
+	retryer       *supervisor.Retryer
+	metrics       *supervisor.Metrics
 	healthChecker *supervisor.HealthChecker
-	upstream     *url.URL
-	nextID       int64 // atomic counter for request IDs
-}
-
-func (h *Handler) modifyResponse(resp *http.Response) error {
-	// If the request was clamped by model/config limits, expose that as a response header.
-	if clamped, ok := resp.Request.Context().Value(ctxClampedKey).(bool); ok && clamped {
-		resp.Header.Set("X-Ollama-CtxProxy-Clamped", "true")
-	}
-
-	// Calibration is optional and should never break the request.
-	if !h.cfg.CalibrationEnabled {
-		return nil
-	}
-	sample, ok := resp.Request.Context().Value(ctxSampleKey).(calibration.Sample)
-	if !ok || sample.Model == "" {
-		return nil
-	}
-
-	ct := resp.Header.Get("Content-Type")
-	// Get request ID from context
-	reqID := ""
-	if reqIDVal := resp.Request.Context().Value(ctxRequestIDKey); reqIDVal != nil {
-		if id, ok := reqIDVal.(string); ok {
-			reqID = id
-		}
-	}
-
-	// Create loop detector if enabled and we have a cancel function
-	var loopDetector *supervisor.LoopDetector
-	var cancelFunc func()
-	if h.cfg.SupervisorLoopDetectEnabled {
-		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
-			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
-				cancelFunc = cancel
-				loopDetector = supervisor.NewLoopDetector(
-					supervisor.LoopDetectorConfig{
-						WindowBytes:     h.cfg.SupervisorLoopWindowBytes,
-						NgramBytes:      h.cfg.SupervisorLoopNgramBytes,
-						RepeatThreshold: h.cfg.SupervisorLoopRepeatThreshold,
-						MinOutputBytes:  h.cfg.SupervisorLoopMinOutputBytes,
-					},
-					reqID,
-					cancel,
-					h.tracker,
-				)
-			}
-		}
-	}
-
-	// Get cancel function for output limit if not already set
-	if cancelFunc == nil {
-		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
-			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
-				cancelFunc = cancel
-			}
-		}
-	}
-
-	// Determine output limit parameters
-	var outputTokenLimit int64
-	var outputLimitAction string
-	var minOutputBytes int64
-	if h.cfg.SupervisorOutputSafetyLimitEnabled && h.cfg.SupervisorOutputSafetyLimitTokens > 0 {
-		outputTokenLimit = int64(h.cfg.SupervisorOutputSafetyLimitTokens)
-		outputLimitAction = h.cfg.SupervisorOutputSafetyLimitAction
-		// Use same minimum as loop detection for consistency
-		minOutputBytes = int64(h.cfg.SupervisorLoopMinOutputBytes)
-		if minOutputBytes < 256 {
-			minOutputBytes = 256 // Minimum enforced by loop detector
-		}
-	}
-
-	resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes, sample, h.calib, h.tracker, loopDetector, reqID, h.logger, outputTokenLimit, outputLimitAction, cancelFunc, minOutputBytes)
-	return nil
+	upstream      *url.URL
+	nextID        int64
 }
 
 // NewHandler constructs the proxy handler.
-func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCache, calib *calibration.Store, tracker *supervisor.Tracker, watchdog *supervisor.Watchdog, eventBus *supervisor.EventBus, retryer *supervisor.Retryer, metrics *supervisor.Metrics, healthChecker *supervisor.HealthChecker, logger *slog.Logger) *Handler {
+func NewHandler(
+	cfg config.Config,
+	features config.Features,
+	upstream *url.URL,
+	showCache *ollama.ShowCache,
+	calib *calibration.Store,
+	store storage.Store,
+	apiServer *api.Server,
+	tracker *supervisor.Tracker,
+	watchdog *supervisor.Watchdog,
+	eventBus *supervisor.EventBus,
+	retryer *supervisor.Retryer,
+	metrics *supervisor.Metrics,
+	healthChecker *supervisor.HealthChecker,
+	logger *slog.Logger,
+) *Handler {
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 	rp.FlushInterval = cfg.FlushInterval
 
 	h := &Handler{
-		cfg:          cfg,
-		upstream:     upstream,
-		logger:       logger,
-		proxy:        rp,
-		showCache:    showCache,
-		calib:        calib,
-		tracker:      tracker,
-		watchdog:     watchdog,
-		eventBus:     eventBus,
-		retryer:      retryer,
-		metrics:      metrics,
+		cfg:           cfg,
+		features:      features,
+		upstream:      upstream,
+		logger:        logger,
+		proxy:         rp,
+		showCache:     showCache,
+		calib:         calib,
+		store:         store,
+		apiServer:     apiServer,
+		tracker:       tracker,
+		watchdog:      watchdog,
+		eventBus:      eventBus,
+		retryer:       retryer,
+		metrics:       metrics,
 		healthChecker: healthChecker,
 	}
 
-	// Tap responses for calibration and add headers without buffering streams.
 	rp.ModifyResponse = h.modifyResponse
 
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		logger.Error("upstream proxy error", "err", err, "path", r.URL.Path)
 
-		// Mark request as failed and stop watchdog if tracking is enabled
 		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
 			if reqID, ok := reqIDVal.(string); ok {
 				if h.tracker != nil {
@@ -180,6 +127,17 @@ func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCach
 				}
 				if h.watchdog != nil {
 					h.watchdog.Stop(reqID)
+				}
+				// Update storage
+				if h.store != nil {
+					now := time.Now().UnixMilli()
+					status := storage.StatusError
+					reason := storage.ReasonUpstreamError
+					h.store.Update(reqID, storage.RequestUpdate{
+						TSEnd:  &now,
+						Status: &status,
+						Reason: &reason,
+					})
 				}
 			}
 		}
@@ -191,10 +149,86 @@ func NewHandler(cfg config.Config, upstream *url.URL, showCache *ollama.ShowCach
 	return h
 }
 
+func (h *Handler) modifyResponse(resp *http.Response) error {
+	if clamped, ok := resp.Request.Context().Value(ctxClampedKey).(bool); ok && clamped {
+		resp.Header.Set("X-Ollama-CtxProxy-Clamped", "true")
+	}
+
+	if !h.cfg.CalibrationEnabled {
+		return nil
+	}
+	sample, ok := resp.Request.Context().Value(ctxSampleKey).(calibration.Sample)
+	if !ok || sample.Model == "" {
+		return nil
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	reqID := ""
+	if reqIDVal := resp.Request.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+		if id, ok := reqIDVal.(string); ok {
+			reqID = id
+		}
+	}
+
+	// Loop detector for protect mode
+	var loopDetector *supervisor.LoopDetector
+	var cancelFunc func()
+	if h.features.Protect && h.cfg.LoopDetectEnabled {
+		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
+			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
+				cancelFunc = cancel
+				loopDetector = supervisor.NewLoopDetector(
+					supervisor.LoopDetectorConfig{
+						WindowBytes:     h.cfg.LoopWindowBytes,
+						NgramBytes:      h.cfg.LoopNgramBytes,
+						RepeatThreshold: h.cfg.LoopRepeatThreshold,
+						MinOutputBytes:  h.cfg.LoopMinOutputBytes,
+					},
+					reqID,
+					cancel,
+					h.tracker,
+				)
+			}
+		}
+	}
+
+	if cancelFunc == nil {
+		if cancelFuncVal := resp.Request.Context().Value(ctxCancelFuncKey); cancelFuncVal != nil {
+			if cancel, ok := cancelFuncVal.(context.CancelFunc); ok {
+				cancelFunc = cancel
+			}
+		}
+	}
+
+	// Output limit for protect mode
+	var outputTokenLimit int64
+	var outputLimitAction string
+	var minOutputBytes int64
+	if h.features.Protect && h.cfg.OutputLimitEnabled && h.cfg.OutputLimitMaxTokens > 0 {
+		outputTokenLimit = int64(h.cfg.OutputLimitMaxTokens)
+		outputLimitAction = "cancel"
+		minOutputBytes = int64(h.cfg.LoopMinOutputBytes)
+		if minOutputBytes < 256 {
+			minOutputBytes = 256
+		}
+	}
+
+	resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes,
+		sample, h.calib, h.tracker, loopDetector, reqID, h.logger,
+		outputTokenLimit, outputLimitAction, cancelFunc, minOutputBytes)
+	return nil
+}
+
 // ServeHTTP implements the proxy + rewrite logic.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// API endpoints (when enabled)
+	if h.features.API && h.apiServer != nil && h.apiServer.Handles(r.URL.Path) {
+		h.apiServer.ServeHTTP(w, r)
+		return
+	}
+
 	// Metrics endpoint
-	if h.cfg.SupervisorMetricsEnabled && r.URL.Path == h.cfg.SupervisorMetricsPath && r.Method == http.MethodGet {
+	if h.features.Metrics && r.URL.Path == "/metrics" && r.Method == http.MethodGet {
 		h.handleMetrics(w, r)
 		return
 	}
@@ -209,49 +243,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dashboard endpoint
-	if r.URL.Path == "/dashboard" && r.Method == http.MethodGet {
+	// Dashboard (when enabled)
+	if h.features.Dashboard && r.URL.Path == "/dashboard" && r.Method == http.MethodGet {
 		h.handleDashboard(w, r)
 		return
 	}
 
-	// Observability endpoints (before tracking to avoid feedback loop)
-	if h.cfg.SupervisorObsEnabled {
-		if r.URL.Path == "/debug/requests" && h.cfg.SupervisorObsRequestsEndpoint && r.Method == http.MethodGet {
-			h.handleDebugRequests(w, r)
-			return
-		}
-		if r.URL.Path == "/events" && h.cfg.SupervisorObsSSEEndpoint && r.Method == http.MethodGet {
-			h.handleSSEEvents(w, r)
-			return
-		}
-		if r.URL.Path == "/config" && h.cfg.SupervisorObsEnabled && r.Method == http.MethodGet {
-			h.handleConfig(w, r)
-			return
-		}
+	// Events SSE (when enabled)
+	if h.features.Events && r.URL.Path == "/events" && r.Method == http.MethodGet {
+		h.handleSSEEvents(w, r)
+		return
 	}
 
-	// Only track Ollama API endpoints (/api/chat and /api/generate)
-	// Skip tracking for observability, health, metrics, and dashboard endpoints
+	// Legacy debug endpoint (redirect to new API)
+	if r.URL.Path == "/debug/requests" && r.Method == http.MethodGet {
+		if h.features.API && h.apiServer != nil {
+			http.Redirect(w, r, "/autoctx/api/v1/requests", http.StatusTemporaryRedirect)
+			return
+		}
+		h.handleDebugRequests(w, r)
+		return
+	}
+
+	// Only track Ollama API endpoints
 	isOllamaEndpoint := (r.Method == http.MethodPost && r.URL.Path == "/api/chat") ||
 		(r.Method == http.MethodPost && r.URL.Path == "/api/generate")
 
-	// Generate request ID for tracking (only for Ollama endpoints)
 	var reqID string
 	if isOllamaEndpoint {
 		reqID = h.generateRequestID()
 	}
 
-	// Build context chain: start with request context, add request ID, optionally add cancellation
 	ctx := r.Context()
 	if isOllamaEndpoint {
 		ctx = context.WithValue(ctx, ctxRequestIDKey, reqID)
 	}
 
-	// Track if request was already finished (by watchdog timeout or error handler)
 	var alreadyFinished bool
 
-	// Start tracking if enabled and this is an Ollama endpoint
+	// Start tracking
 	if h.tracker != nil && isOllamaEndpoint {
 		endpoint := ""
 		if r.URL.Path == "/api/chat" {
@@ -261,9 +291,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		stream := r.URL.Query().Get("stream") == "true"
-		h.tracker.Start(reqID, endpoint, "", stream) // model will be determined later
+		h.tracker.Start(reqID, endpoint, "", stream)
 
-		// Ensure request is marked as finished on all exit paths (unless already finished)
 		defer func() {
 			if !alreadyFinished && h.tracker.GetRequestInfo(reqID) != nil {
 				h.tracker.Finish(reqID, supervisor.StatusSuccess, nil)
@@ -271,26 +300,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Set up context cancellation for watchdog and/or loop detection (only for Ollama endpoints)
+	// Context cancellation for watchdog/loop detection
 	var cancel context.CancelFunc
-	needsCancel := isOllamaEndpoint && (h.watchdog != nil || h.cfg.SupervisorLoopDetectEnabled)
+	needsCancel := isOllamaEndpoint && (h.watchdog != nil || (h.features.Protect && h.cfg.LoopDetectEnabled))
 	if needsCancel {
 		ctx, cancel = context.WithCancel(ctx)
-		// Store cancel func in context for loop detector to use
 		ctx = context.WithValue(ctx, ctxCancelFuncKey, cancel)
 
 		if h.watchdog != nil {
 			h.watchdog.Start(reqID, cancel)
-			// Ensure watchdog stops monitoring when request finishes
 			defer h.watchdog.Stop(reqID)
 		}
 	}
 
-	// Apply the complete context to the request
 	*r = *r.WithContext(ctx)
-	_ = cancel // silence unused warning when cancel is nil
+	_ = cancel
 
-	// Simple CORS support (can be disabled by setting CORS_ALLOW_ORIGIN="").
+	// CORS
 	if h.cfg.CORSAllowOrigin != "" {
 		w.Header().Set("Access-Control-Allow-Origin", h.cfg.CORSAllowOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -298,14 +324,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Expose-Headers", "X-Ollama-CtxProxy-Clamped")
 	}
 	if r.Method == http.MethodOptions {
-		// Preflight: reply quickly.
 		if r.Header.Get("Access-Control-Request-Method") != "" {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
 
-	// Only rewrite the two core endpoints. Everything else is pass-through.
+	// Only rewrite the two core endpoints
 	endpoint := ""
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/api/chat":
@@ -318,22 +343,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.rewriteRequestIfPossible(endpoint, r)
 	}
 
-	// Delegate to reverse proxy.
 	h.proxy.ServeHTTP(w, r)
 }
 
 func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
-	// Only attempt if the request body is small enough and likely JSON.
 	if r.Body == nil {
 		return
 	}
 	if r.ContentLength < 0 || r.ContentLength > h.cfg.RequestBodyMaxBytes {
-		// Unknown/large bodies: don't parse; pass-through.
 		return
 	}
 	ct := r.Header.Get("Content-Type")
 	if ct != "" && !strings.Contains(ct, "application/json") {
-		// Some clients omit content-type; if set and not JSON, don't touch.
 		return
 	}
 
@@ -343,19 +364,30 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		return
 	}
 
-	// Always restore the body, even if parsing fails.
 	setBody(r, body)
 
 	reqMap, err := util.DecodeJSONMap(body)
 	if err != nil {
-		// Invalid JSON: pass-through unchanged.
 		return
 	}
 
-	// Extract thinking directive from system prompt (this also strips it from the prompt)
+	// Parse metadata for storage
+	if h.store != nil {
+		meta := ParseRequestMetadata(endpoint, reqMap, len(body))
+		reqID := ""
+		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+			reqID, _ = reqIDVal.(string)
+		}
+		if reqID != "" {
+			storageReq := meta.ToStorageRequest(reqID, time.Now().UnixMilli())
+			if err := h.store.Insert(storageReq); err != nil {
+				h.logger.Error("failed to insert request to storage", "err", err)
+			}
+		}
+	}
+
 	systemPromptThinkVerdict := estimate.ExtractThinkingFromSystemPrompt(reqMap, endpoint)
 
-	// Strip system prompt text if configured
 	if h.cfg.StripSystemPromptText != "" {
 		estimate.StripSystemPromptText(reqMap, endpoint, h.cfg.StripSystemPromptText)
 	}
@@ -368,7 +400,7 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		return
 	}
 
-	// Update tracker with model information if tracking is enabled
+	// Update tracker with model
 	if h.tracker != nil {
 		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
 			if reqID, ok := reqIDVal.(string); ok {
@@ -377,17 +409,14 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		}
 	}
 
-	// Fetch model limits (cached). If this fails, we fall back to config max.
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	show, showErr := h.showCache.Get(ctx, features.Model)
 	maxModelCtx, _ := show.MaxContextLength()
 	if showErr != nil {
-		// Don't fail request, just log at debug.
 		h.logger.Debug("/api/show failed; using config max only", "model", features.Model, "err", showErr)
 	}
 
-	// Tokens-per-image: use model value if available, else fallback.
 	tokensPerImage, ok := show.TokensPerImage()
 	if !ok {
 		tokensPerImage = h.cfg.DefaultTokensPerImageFallback
@@ -395,7 +424,6 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 
 	params := h.calib.Get(features.Model)
 
-	// Effective max is the min of (config max, model max, per-model safe max (if set)).
 	effMax := h.cfg.MaxCtx
 	maxSafe := 0
 	if params.SafeMaxCtx > 0 {
@@ -407,7 +435,6 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 	if maxModelCtx > 0 && maxModelCtx < effMax {
 		effMax = maxModelCtx
 	}
-	// Effective min cannot exceed effective max.
 	effMin := h.cfg.MinCtx
 	if effMax > 0 && effMin > effMax {
 		effMin = effMax
@@ -421,32 +448,25 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 	bucket := estimate.Bucketize(neededHeadroom, h.cfg.Buckets)
 	desiredCtx := estimate.ClampCtx(bucket, effMin, effMax)
 
-	// Decide final context window based on override policy and any user-provided value.
 	finalCtx, override, clamped := chooseFinalCtx(desiredCtx, effMax, features.ProvidedNumCtx, features.ProvidedNumCtxOK, h.cfg.OverrideNumCtx)
 
-	// Validate system prompt thinking verdict against model family
 	finalThinkVerdict := ""
 	if systemPromptThinkVerdict != "" {
 		modelLower := strings.ToLower(features.Model)
 		if strings.HasPrefix(modelLower, "qwen3") || strings.HasPrefix(modelLower, "deepseek") {
-			// Boolean type: only accept "true" or "false"
 			if systemPromptThinkVerdict == "true" || systemPromptThinkVerdict == "false" {
 				finalThinkVerdict = systemPromptThinkVerdict
 			}
 		} else if strings.HasPrefix(modelLower, "gpt-oss") {
-			// Level type: only accept "low", "medium", or "high"
 			if systemPromptThinkVerdict == "low" || systemPromptThinkVerdict == "medium" || systemPromptThinkVerdict == "high" {
 				finalThinkVerdict = systemPromptThinkVerdict
 			}
 		}
 	}
 
-	// Prepare to modify request body if needed
 	needsRewrite := override || clamped || finalThinkVerdict != ""
 
-	// If we need to inject/adjust options.num_ctx or thinking mode, do it.
 	if needsRewrite {
-		// Inject num_ctx if needed
 		if override || clamped {
 			opt, ok := reqMap["options"].(map[string]any)
 			if !ok || opt == nil {
@@ -456,14 +476,11 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 			reqMap["options"] = opt
 		}
 
-		// Inject thinking option at top level if we have a verdict
 		if finalThinkVerdict != "" {
 			modelLower := strings.ToLower(features.Model)
 			if strings.HasPrefix(modelLower, "qwen3") || strings.HasPrefix(modelLower, "deepseek") {
-				// Boolean type: convert string to bool
 				reqMap["think"] = (finalThinkVerdict == "true")
 			} else if strings.HasPrefix(modelLower, "gpt-oss") {
-				// Level type: pass string directly
 				reqMap["think"] = finalThinkVerdict
 			}
 		}
@@ -475,7 +492,6 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 		setBody(r, newBody)
 	}
 
-	// Store sample + decision in request context for response tapping/logging.
 	imageTokens := tokensPerImage * features.ImageCount
 	sample := calibration.Sample{
 		Model:        features.Model,
@@ -512,47 +528,40 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 	}
 	*r = *r.WithContext(ctx2)
 
-	// Update tracker with context sizing information
-	if h.tracker != nil {
-		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
-			if reqID, ok := reqIDVal.(string); ok {
+	// Update tracker and storage with context data
+	if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
+		if reqID, ok := reqIDVal.(string); ok {
+			if h.tracker != nil {
 				h.tracker.UpdateContextData(reqID, dec.EstimatedPromptTokens, dec.ChosenCtx, dec.OutputBudgetTokens)
+			}
+			if h.store != nil {
+				ctxEst := dec.EstimatedPromptTokens
+				ctxSelected := dec.ChosenCtx
+				ctxBucket := bucket
+				outBudget := dec.OutputBudgetTokens
+				h.store.Update(reqID, storage.RequestUpdate{
+					CtxEst:       &ctxEst,
+					CtxSelected:  &ctxSelected,
+					CtxBucket:    &ctxBucket,
+					OutputBudget: &outBudget,
+				})
 			}
 		}
 	}
 
-	// Structured log for the decision.
 	h.logger.Info("ctx decision",
 		"path", r.URL.Path,
 		"model", dec.Model,
-		"endpoint", dec.Endpoint,
 		"prompt_tokens_est", dec.EstimatedPromptTokens,
 		"output_budget", dec.OutputBudgetTokens,
-		"output_budget_source", dec.OutputBudgetSource,
-		"needed", dec.NeededTokens,
-		"needed_headroom", dec.NeededWithHeadroom,
 		"chosen_ctx", dec.ChosenCtx,
-		"user_ctx", dec.UserCtx,
-		"user_ctx_provided", dec.UserCtxProvided,
-		"override_applied", dec.OverrideApplied,
 		"clamped", dec.Clamped,
-		"max_model_ctx", dec.MaxModelCtx,
-		"max_safe_ctx", dec.MaxSafeCtx,
-		"think_verdict", dec.ThinkVerdict,
 	)
 }
 
-// chooseFinalCtx applies the override policy and hard clamps (model/config safety).
-//
-// Returns:
-// - finalCtx:  the context window that will actually be used upstream
-// - override:  whether we should inject/overwrite options.num_ctx in the request
-// - clamped:   whether we had to forcibly clamp a user-provided ctx down to a hard maximum
 func chooseFinalCtx(desiredCtx, hardMax int, userCtx int, userProvided bool, policy config.OverridePolicy) (finalCtx int, override bool, clamped bool) {
-	// desiredCtx is already clamped to [effMin, hardMax].
 	finalCtx = desiredCtx
 
-	// If user provides a ctx larger than hardMax, we MUST clamp or the request may fail/oom.
 	if userProvided && hardMax > 0 && userCtx > hardMax {
 		finalCtx = hardMax
 		override = true
@@ -561,7 +570,6 @@ func chooseFinalCtx(desiredCtx, hardMax int, userCtx int, userProvided bool, pol
 	}
 
 	if !userProvided {
-		// No user ctx: we always set one to make behavior deterministic.
 		return desiredCtx, true, false
 	}
 
@@ -576,7 +584,6 @@ func chooseFinalCtx(desiredCtx, hardMax int, userCtx int, userProvided bool, pol
 		}
 		return userCtx, false, false
 	default:
-		// Be conservative.
 		if userCtx < desiredCtx {
 			return desiredCtx, true, false
 		}
@@ -587,20 +594,14 @@ func chooseFinalCtx(desiredCtx, hardMax int, userCtx int, userProvided bool, pol
 func setBody(r *http.Request, b []byte) {
 	r.Body = io.NopCloser(bytes.NewReader(b))
 	r.ContentLength = int64(len(b))
-	r.Header.Set("Content-Length", intToString(len(b)))
+	r.Header.Set("Content-Length", strconv.Itoa(len(b)))
 }
 
-func intToString(n int) string {
-	return strconv.Itoa(n)
-}
-
-// generateRequestID generates a unique request ID using an atomic counter.
 func (h *Handler) generateRequestID() string {
 	id := atomic.AddInt64(&h.nextID, 1)
 	return strconv.FormatInt(id, 10)
 }
 
-// handleDebugRequests returns the current state of in-flight and recent requests.
 func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 	if h.tracker == nil {
 		http.Error(w, "tracker not available", http.StatusServiceUnavailable)
@@ -609,7 +610,6 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 
 	snapshot := h.tracker.Snapshot()
 
-	// Enrich with estimated output tokens
 	type EnrichedRequestInfo struct {
 		supervisor.RequestInfo
 		EstimatedOutputTokens int64 `json:"estimated_output_tokens"`
@@ -625,7 +625,6 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 		Recent:   make([]EnrichedRequestInfo, 0, len(snapshot.Recent)),
 	}
 
-	// Enrich in-flight requests
 	for id, req := range snapshot.InFlight {
 		estTokens := supervisor.EstimateOutputTokens(req.BytesForwarded, req.Model, h.calib, h.cfg.DefaultTokensPerByte)
 		resp.InFlight[id] = EnrichedRequestInfo{
@@ -634,7 +633,6 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Enrich recent requests
 	for _, req := range snapshot.Recent {
 		estTokens := supervisor.EstimateOutputTokens(req.BytesForwarded, req.Model, h.calib, h.cfg.DefaultTokensPerByte)
 		resp.Recent = append(resp.Recent, EnrichedRequestInfo{
@@ -644,19 +642,15 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		h.logger.Error("failed to encode debug requests response", "err", err)
-	}
+	json.NewEncoder(w).Encode(resp)
 }
 
-// handleSSEEvents streams Server-Sent Events for real-time request monitoring.
 func (h *Handler) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 	if h.eventBus == nil {
 		http.Error(w, "event bus not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -670,33 +664,26 @@ func (h *Handler) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Subscribe to event bus
 	eventCh := h.eventBus.Subscribe()
 	defer h.eventBus.Unsubscribe(eventCh)
 
-	// Send initial state marker (SSE comment)
 	_, _ = w.Write([]byte(": connected\n\n"))
 	flusher.Flush()
 
-	// Stream events
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
-			// Client disconnected
 			return
 		case event, ok := <-eventCh:
 			if !ok {
-				// Channel closed
 				return
 			}
 			sseData, err := supervisor.FormatSSEEvent(event)
 			if err != nil {
-				h.logger.Error("failed to format SSE event", "err", err)
 				continue
 			}
 			if _, err := w.Write([]byte(sseData)); err != nil {
-				// Client disconnected
 				return
 			}
 			flusher.Flush()
@@ -704,34 +691,32 @@ func (h *Handler) handleSSEEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleMetrics serves Prometheus metrics.
 func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if h.metrics == nil {
 		http.Error(w, "metrics not enabled", http.StatusServiceUnavailable)
 		return
 	}
-
-	// Use Prometheus handler to serve metrics
 	promhttp.Handler().ServeHTTP(w, r)
 }
 
-// handleHealthz serves the combined proxy + upstream health check.
 func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	// Check upstream health if health checker is enabled
 	if h.healthChecker != nil && !h.healthChecker.Healthy() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("upstream unhealthy"))
 		return
 	}
-
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
-// handleHealthzUpstream serves upstream-only health status with details.
 func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) {
 	if h.healthChecker == nil {
-		http.Error(w, "health check not enabled", http.StatusServiceUnavailable)
+		// No health checker but still return something useful
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"healthy":    true,
+			"last_check": time.Now().Format(time.RFC3339),
+		})
 		return
 	}
 
@@ -746,8 +731,8 @@ func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
-	response := map[string]interface{}{
-		"healthy":   healthy,
+	response := map[string]any{
+		"healthy":    healthy,
 		"last_check": lastCheck.Format(time.RFC3339),
 	}
 	if lastError != "" {
@@ -757,116 +742,8 @@ func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleDashboard serves the monitoring dashboard HTML page.
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(dashboardHTML))
-}
-
-// handleConfig returns the current configuration as JSON.
-func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	
-	// Create a map with all config values
-	config := map[string]interface{}{
-		"listen_addr":  h.cfg.ListenAddr,
-		"upstream_url": h.cfg.UpstreamURL,
-		
-		// Context window
-		"min_ctx":   h.cfg.MinCtx,
-		"max_ctx":   h.cfg.MaxCtx,
-		"buckets":   h.cfg.Buckets,
-		"headroom":  h.cfg.Headroom,
-		
-		// Output token budgeting
-		"default_output_budget":         h.cfg.DefaultOutputBudget,
-		"max_output_budget":            h.cfg.MaxOutputBudget,
-		"structured_overhead":          h.cfg.StructuredOverhead,
-		"dynamic_default_output_budget": h.cfg.DynamicDefaultOutputBudget,
-		
-		// Estimation defaults
-		"default_fixed_overhead_tokens":    h.cfg.DefaultFixedOverheadTokens,
-		"default_per_message_overhead":     h.cfg.DefaultPerMessageOverhead,
-		"default_tokens_per_byte":          h.cfg.DefaultTokensPerByte,
-		"default_tokens_per_image_fallback": h.cfg.DefaultTokensPerImageFallback,
-		
-		// Override policy
-		"override_num_ctx": string(h.cfg.OverrideNumCtx),
-		
-		// Safety + performance
-		"request_body_max_bytes": h.cfg.RequestBodyMaxBytes,
-		"response_tap_max_bytes": h.cfg.ResponseTapMaxBytes,
-		"show_cache_ttl":         h.cfg.ShowCacheTTL.String(),
-		"calibration_enabled":    h.cfg.CalibrationEnabled,
-		"calibration_file":       h.cfg.CalibrationFile,
-		"hardware_probe":         h.cfg.HardwareProbe,
-		"hardware_probe_refresh":  h.cfg.HardwareProbeRefresh.String(),
-		"hardware_probe_vram_headroom": h.cfg.HardwareProbeVramHeadroom,
-		
-		// HTTP
-		"cors_allow_origin": h.cfg.CORSAllowOrigin,
-		"flush_interval":     h.cfg.FlushInterval.String(),
-		
-		// Logging
-		"log_level": h.cfg.LogLevel,
-		
-		// System prompt
-		"strip_system_prompt_text": h.cfg.StripSystemPromptText,
-		
-		// Supervisor
-		"supervisor_enabled":        h.cfg.SupervisorEnabled,
-		"supervisor_track_requests": h.cfg.SupervisorTrackRequests,
-		"supervisor_recent_buffer":   h.cfg.SupervisorRecentBuffer,
-		
-		// Supervisor watchdog
-		"supervisor_watchdog_enabled": h.cfg.SupervisorWatchdogEnabled,
-		"supervisor_ttfb_timeout":     h.cfg.SupervisorTTFBTimeout.String(),
-		"supervisor_stall_timeout":     h.cfg.SupervisorStallTimeout.String(),
-		"supervisor_hard_timeout":     h.cfg.SupervisorHardTimeout.String(),
-		
-		// Supervisor observability
-		"supervisor_obs_enabled":           h.cfg.SupervisorObsEnabled,
-		"supervisor_obs_requests_endpoint": h.cfg.SupervisorObsRequestsEndpoint,
-		"supervisor_obs_sse_endpoint":       h.cfg.SupervisorObsSSEEndpoint,
-		"supervisor_obs_progress_interval":  h.cfg.SupervisorObsProgressInterval.String(),
-		
-		// Supervisor loop detection
-		"supervisor_loop_detect_enabled":    h.cfg.SupervisorLoopDetectEnabled,
-		"supervisor_loop_window_bytes":      h.cfg.SupervisorLoopWindowBytes,
-		"supervisor_loop_ngram_bytes":      h.cfg.SupervisorLoopNgramBytes,
-		"supervisor_loop_repeat_threshold":  h.cfg.SupervisorLoopRepeatThreshold,
-		"supervisor_loop_min_output_bytes":  h.cfg.SupervisorLoopMinOutputBytes,
-		
-		// Supervisor retry
-		"supervisor_retry_enabled":              h.cfg.SupervisorRetryEnabled,
-		"supervisor_retry_max_attempts":         h.cfg.SupervisorRetryMaxAttempts,
-		"supervisor_retry_backoff":              h.cfg.SupervisorRetryBackoff.String(),
-		"supervisor_retry_only_non_streaming":    h.cfg.SupervisorRetryOnlyNonStreaming,
-		"supervisor_retry_max_response_bytes":   h.cfg.SupervisorRetryMaxResponseBytes,
-		
-		// Supervisor restart
-		"supervisor_restart_enabled":                  h.cfg.SupervisorRestartEnabled,
-		"supervisor_restart_cmd":                      h.cfg.SupervisorRestartCmd,
-		"supervisor_restart_cooldown":                 h.cfg.SupervisorRestartCooldown.String(),
-		"supervisor_restart_max_per_hour":             h.cfg.SupervisorRestartMaxPerHour,
-		"supervisor_restart_trigger_consec_timeouts":  h.cfg.SupervisorRestartTriggerConsecTimeouts,
-		"supervisor_restart_cmd_timeout":              h.cfg.SupervisorRestartCmdTimeout.String(),
-		
-		// Supervisor metrics
-		"supervisor_metrics_enabled": h.cfg.SupervisorMetricsEnabled,
-		"supervisor_metrics_path":    h.cfg.SupervisorMetricsPath,
-		
-		// Supervisor health check
-		"supervisor_health_check_enabled":  h.cfg.SupervisorHealthCheckEnabled,
-		"supervisor_health_check_interval": h.cfg.SupervisorHealthCheckInterval.String(),
-		"supervisor_health_check_timeout":   h.cfg.SupervisorHealthCheckTimeout.String(),
-		
-		// Supervisor output safety limit
-		"supervisor_output_safety_limit_enabled": h.cfg.SupervisorOutputSafetyLimitEnabled,
-		"supervisor_output_safety_limit_tokens":  h.cfg.SupervisorOutputSafetyLimitTokens,
-		"supervisor_output_safety_limit_action":  h.cfg.SupervisorOutputSafetyLimitAction,
-	}
-	
-	json.NewEncoder(w).Encode(config)
 }

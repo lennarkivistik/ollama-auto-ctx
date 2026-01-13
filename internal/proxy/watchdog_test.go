@@ -20,14 +20,19 @@ import (
 
 func createTestHandlerWithUpstream(cfg config.Config, upstreamURL string) *Handler {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	features := cfg.Features()
 
 	var tracker *supervisor.Tracker
 	var watchdog *supervisor.Watchdog
 
-	if cfg.SupervisorEnabled {
-		tracker = supervisor.NewTracker(cfg.SupervisorRecentBuffer, nil, nil, 0.25, 250*time.Millisecond, nil)
-		if cfg.SupervisorWatchdogEnabled {
-			watchdog = supervisor.NewWatchdog(tracker, cfg.SupervisorTTFBTimeout, cfg.SupervisorStallTimeout, cfg.SupervisorHardTimeout, logger, nil)
+	if features.Retry || features.Protect {
+		tracker = supervisor.NewTracker(cfg.RecentBuffer, nil, nil, 0.25, 250*time.Millisecond, nil)
+		if features.Protect {
+			watchdog = supervisor.NewWatchdog(tracker, 
+				time.Duration(cfg.TimeoutTTFBMs)*time.Millisecond, 
+				time.Duration(cfg.TimeoutStallMs)*time.Millisecond, 
+				time.Duration(cfg.TimeoutHardMs)*time.Millisecond, 
+				logger, nil)
 			go watchdog.Run()
 		}
 	}
@@ -36,7 +41,7 @@ func createTestHandlerWithUpstream(cfg config.Config, upstreamURL string) *Handl
 	calibStore := &calibration.Store{} // mock
 
 	upstream, _ := url.Parse(upstreamURL)
-	handler := NewHandler(cfg, upstream, showCache, calibStore, tracker, watchdog, nil, nil, nil, nil, logger)
+	handler := NewHandler(cfg, features, upstream, showCache, calibStore, nil, nil, tracker, watchdog, nil, nil, nil, nil, logger)
 
 	return handler
 }
@@ -64,15 +69,13 @@ func TestWatchdog_TTFBTimeout_Integration(t *testing.T) {
 		upstream.Close()
 	}()
 
-	// Create proxy with watchdog enabled
+	// Create proxy with watchdog enabled (protect mode)
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorWatchdogEnabled: true,
-		SupervisorTTFBTimeout:   100 * time.Millisecond,
-		SupervisorStallTimeout:  1 * time.Second,
-		SupervisorHardTimeout:   10 * time.Second,
-		SupervisorRecentBuffer:  10,
+		Mode:          config.ModeProtect,
+		TimeoutTTFBMs: 100,
+		TimeoutStallMs: 1000,
+		TimeoutHardMs:  10000,
+		RecentBuffer:  10,
 	}
 
 	handler := createTestHandlerWithUpstream(cfg, upstream.URL)
@@ -128,15 +131,13 @@ func TestWatchdog_StallTimeout_Integration(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// Create proxy with watchdog enabled
+	// Create proxy with watchdog enabled (protect mode)
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorWatchdogEnabled: true,
-		SupervisorTTFBTimeout:   1 * time.Second,
-		SupervisorStallTimeout:  100 * time.Millisecond,
-		SupervisorHardTimeout:   10 * time.Second,
-		SupervisorRecentBuffer:  10,
+		Mode:          config.ModeProtect,
+		TimeoutTTFBMs: 1000,
+		TimeoutStallMs: 100,
+		TimeoutHardMs:  10000,
+		RecentBuffer:  10,
 	}
 
 	handler := createTestHandlerWithUpstream(cfg, upstream.URL)
@@ -195,13 +196,11 @@ func TestWatchdog_HardTimeout_Integration(t *testing.T) {
 
 	// Create proxy with watchdog enabled and short hard timeout
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorWatchdogEnabled: true,
-		SupervisorTTFBTimeout:   10 * time.Second,
-		SupervisorStallTimeout:  10 * time.Second,
-		SupervisorHardTimeout:   200 * time.Millisecond, // Short hard timeout
-		SupervisorRecentBuffer:  10,
+		Mode:          config.ModeProtect,
+		TimeoutTTFBMs: 10000,
+		TimeoutStallMs: 10000,
+		TimeoutHardMs:  200, // Short hard timeout
+		RecentBuffer:  10,
 	}
 
 	handler := createTestHandlerWithUpstream(cfg, upstream.URL)
@@ -265,13 +264,11 @@ func TestWatchdog_StreamingPreservation(t *testing.T) {
 
 	// Create proxy with watchdog enabled but generous timeouts
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorWatchdogEnabled: true,
-		SupervisorTTFBTimeout:   1 * time.Second,
-		SupervisorStallTimeout:  1 * time.Second,
-		SupervisorHardTimeout:   10 * time.Second,
-		SupervisorRecentBuffer:  10,
+		Mode:          config.ModeProtect,
+		TimeoutTTFBMs: 1000,
+		TimeoutStallMs: 1000,
+		TimeoutHardMs:  10000,
+		RecentBuffer:  10,
 	}
 
 	handler := createTestHandlerWithUpstream(cfg, upstream.URL)
@@ -333,10 +330,10 @@ func TestWatchdog_Disabled_NoImpact(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// Create proxy with watchdog disabled (default)
+	// Create proxy with watchdog disabled (off mode)
 	cfg := config.Config{
-		SupervisorEnabled:       false, // Disabled
-		SupervisorRecentBuffer:  10,
+		Mode:         config.ModeOff,
+		RecentBuffer: 10,
 	}
 
 	handler := createTestHandlerWithUpstream(cfg, upstream.URL)

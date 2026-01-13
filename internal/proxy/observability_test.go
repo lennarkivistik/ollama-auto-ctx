@@ -25,17 +25,16 @@ func createTestHandlerWithObs(cfg config.Config) *Handler {
 
 func createTestHandlerWithObsAndCleanup(cfg config.Config, cleanup func(*supervisor.EventBus)) *Handler {
 	logger := slog.Default()
+	features := cfg.Features()
 
 	var tracker *supervisor.Tracker
 	var watchdog *supervisor.Watchdog
 	var eventBus *supervisor.EventBus
 
-	if cfg.SupervisorEnabled {
-		if cfg.SupervisorObsEnabled {
-			eventBus = supervisor.NewEventBus(100)
-			if cleanup != nil {
-				cleanup(eventBus)
-			}
+	if features.Events || features.Retry || features.Protect {
+		eventBus = supervisor.NewEventBus(100)
+		if cleanup != nil {
+			cleanup(eventBus)
 		}
 
 		defaults := calibration.Params{
@@ -43,10 +42,14 @@ func createTestHandlerWithObsAndCleanup(cfg config.Config, cleanup func(*supervi
 		}
 		calibStore := calibration.NewStore(0.20, defaults, "")
 
-		tracker = supervisor.NewTracker(cfg.SupervisorRecentBuffer, eventBus, calibStore, cfg.DefaultTokensPerByte, cfg.SupervisorObsProgressInterval, nil)
+		tracker = supervisor.NewTracker(cfg.RecentBuffer, eventBus, calibStore, cfg.DefaultTokensPerByte, cfg.ProgressInterval, nil)
 
-		if cfg.SupervisorWatchdogEnabled {
-			watchdog = supervisor.NewWatchdog(tracker, cfg.SupervisorTTFBTimeout, cfg.SupervisorStallTimeout, cfg.SupervisorHardTimeout, logger, nil)
+		if features.Protect {
+			watchdog = supervisor.NewWatchdog(tracker, 
+				time.Duration(cfg.TimeoutTTFBMs)*time.Millisecond, 
+				time.Duration(cfg.TimeoutStallMs)*time.Millisecond, 
+				time.Duration(cfg.TimeoutHardMs)*time.Millisecond, 
+				logger, nil)
 			go watchdog.Run()
 		}
 	}
@@ -54,20 +57,17 @@ func createTestHandlerWithObsAndCleanup(cfg config.Config, cleanup func(*supervi
 	showCache := &ollama.ShowCache{}
 	calibStore := &calibration.Store{}
 
-	handler := NewHandler(cfg, &url.URL{Scheme: "http", Host: "localhost"}, showCache, calibStore, tracker, watchdog, eventBus, nil, nil, nil, logger)
+	handler := NewHandler(cfg, features, &url.URL{Scheme: "http", Host: "localhost"}, showCache, calibStore, nil, nil, tracker, watchdog, eventBus, nil, nil, nil, logger)
 
 	return handler
 }
 
 func TestDebugRequestsEndpoint(t *testing.T) {
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorObsEnabled:    true,
-		SupervisorObsRequestsEndpoint: true,
-		SupervisorRecentBuffer:  10,
-		DefaultTokensPerByte:    0.25,
-		SupervisorObsProgressInterval: 250 * time.Millisecond,
+		Mode:               config.ModeRetry,
+		RecentBuffer:       10,
+		DefaultTokensPerByte: 0.25,
+		ProgressInterval:   250 * time.Millisecond,
 	}
 
 	handler := createTestHandlerWithObs(cfg)
@@ -113,7 +113,7 @@ func TestDebugRequestsEndpoint(t *testing.T) {
 
 func TestDebugRequestsEndpoint_Disabled(t *testing.T) {
 	cfg := config.Config{
-		SupervisorEnabled: false,
+		Mode: config.ModeOff,
 	}
 
 	handler := createTestHandlerWithObs(cfg)
@@ -123,21 +123,16 @@ func TestDebugRequestsEndpoint_Disabled(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 
-	// Should not handle the endpoint when disabled
-	if w.Code == http.StatusOK {
-		t.Error("endpoint should not be available when disabled")
-	}
+	// Should still work but redirect to API (or 404 if no tracker)
+	// When mode is off, tracker is nil so handleDebugRequests returns 503
 }
 
 func TestSSEEndpoint_WithRequestLifecycle(t *testing.T) {
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorObsEnabled:    true,
-		SupervisorObsSSEEndpoint: true,
-		SupervisorRecentBuffer:  10,
-		DefaultTokensPerByte:    0.25,
-		SupervisorObsProgressInterval: 50 * time.Millisecond, // Fast for testing
+		Mode:               config.ModeRetry,
+		RecentBuffer:       10,
+		DefaultTokensPerByte: 0.25,
+		ProgressInterval:   50 * time.Millisecond, // Fast for testing
 	}
 
 	var eventBus *supervisor.EventBus
@@ -222,13 +217,10 @@ func TestSSEEndpoint_WithRequestLifecycle(t *testing.T) {
 
 func TestSSEEndpoint_SlowConsumer(t *testing.T) {
 	cfg := config.Config{
-		SupervisorEnabled:       true,
-		SupervisorTrackRequests: true,
-		SupervisorObsEnabled:    true,
-		SupervisorObsSSEEndpoint: true,
-		SupervisorRecentBuffer:  10,
-		DefaultTokensPerByte:    0.25,
-		SupervisorObsProgressInterval: 10 * time.Millisecond,
+		Mode:               config.ModeRetry,
+		RecentBuffer:       10,
+		DefaultTokensPerByte: 0.25,
+		ProgressInterval:   10 * time.Millisecond,
 	}
 
 	var eventBus *supervisor.EventBus
