@@ -107,7 +107,8 @@ get_installed_version() {
 # Download release binary from GitHub
 download_release() {
     local version="$1"
-    local platform="$2"
+    local os="$2"
+    local arch="$3"
     
     # Construct download URL
     # Expected asset name: ollama-auto-ctx_<version>_<os>_<arch>.tar.gz or ollama-auto-ctx_<os>_<arch>
@@ -115,11 +116,13 @@ download_release() {
     
     # Try different naming conventions
     local asset_names=(
-        "ollama-auto-ctx_${version#v}_${platform}.tar.gz"
-        "ollama-auto-ctx_${platform}.tar.gz"
-        "ollama-auto-ctx_${version#v}_${platform}"
-        "ollama-auto-ctx_${platform}"
-        "ollama-auto-ctx-${platform}"
+        "ollama-auto-ctx-${os}-${arch}-${version}"
+        "ollama-auto-ctx-${os}-${arch}-${version#v}"
+        "ollama-auto-ctx_${version#v}_${os}_${arch}.tar.gz"
+        "ollama-auto-ctx_${os}_${arch}.tar.gz"
+        "ollama-auto-ctx_${version#v}_${os}_${arch}"
+        "ollama-auto-ctx_${os}_${arch}"
+        "ollama-auto-ctx-${os}-${arch}"
     )
     
     local tmp_dir=$(mktemp -d)
@@ -128,6 +131,10 @@ download_release() {
     for asset_name in "${asset_names[@]}"; do
         local download_url="${base_url}/${asset_name}"
         echo "Trying to download: $download_url"
+        if [[ -n "$DEBUG" ]]; then
+            echo "  Asset name: $asset_name"
+            echo "  Base URL: $base_url"
+        fi
         
         if command -v curl &> /dev/null; then
             if curl -fsSL -o "${tmp_dir}/${asset_name}" "$download_url" 2>/dev/null; then
@@ -144,10 +151,14 @@ download_release() {
     
     if [[ "$downloaded" != true ]]; then
         echo ""
-        echo "Could not download pre-built binary for $platform"
+        echo "Could not download pre-built binary for ${os}-${arch}"
+        echo "Tried the following URLs:"
+        for asset_name in "${asset_names[@]}"; do
+            echo "  - ${base_url}/${asset_name}"
+        done
         echo ""
         echo "Options:"
-        echo "  1. Build from source: Remove --no-build flag or run without download"
+        echo "  1. Build from source: Use --build flag"
         echo "  2. Provide binary: Use --binary-path /path/to/binary"
         echo "  3. Check releases: https://github.com/${GITHUB_REPO}/releases"
         echo ""
@@ -155,13 +166,18 @@ download_release() {
         return 1
     fi
     
-    # Extract if tarball
+    # Extract if tarball, otherwise it's a direct binary
     if [[ "$asset_name" == *.tar.gz ]]; then
         echo "Extracting archive..."
         tar -xzf "${tmp_dir}/${asset_name}" -C "$tmp_dir"
-        # Find the binary
+        # Find the binary (should be named ollama-auto-ctx)
         BINARY_PATH=$(find "$tmp_dir" -name "ollama-auto-ctx" -type f | head -1)
+        if [[ -z "$BINARY_PATH" ]]; then
+            # Try finding any executable file
+            BINARY_PATH=$(find "$tmp_dir" -type f -executable | head -1)
+        fi
     else
+        # Direct binary
         BINARY_PATH="${tmp_dir}/${asset_name}"
     fi
     
@@ -257,6 +273,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Install, upgrade, or uninstall ollama-auto-ctx as a systemd service"
             echo "Downloads the latest release from GitHub by default"
+            echo ""
+            echo "Release naming: ollama-auto-ctx-{os}-{arch}-{version}"
+            echo "Example: ollama-auto-ctx-linux-amd64-v1.1.1"
             echo ""
             echo "Actions:"
             echo "  install    Install the service (default)"
@@ -390,8 +409,8 @@ upgrade_service() {
     
     # Detect platform and download
     detect_platform
-    
-    if ! download_release "$VERSION" "$PLATFORM"; then
+
+    if ! download_release "$VERSION" "$OS" "$ARCH"; then
         echo "Failed to download release"
         exit 1
     fi
@@ -481,7 +500,7 @@ install_service() {
             VERSION="$LATEST_VERSION"
         fi
         
-        if ! download_release "$VERSION" "$PLATFORM"; then
+        if ! download_release "$VERSION" "$OS" "$ARCH"; then
             echo ""
             echo "Failed to download release. Try one of:"
             echo "  --build          Build from source"
