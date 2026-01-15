@@ -176,6 +176,42 @@ func TestTracker_UpdateModel(t *testing.T) {
 	}
 }
 
+func TestTracker_TTFBDataPreservedAfterFinish(t *testing.T) {
+	tracker := NewTracker(10, nil, nil, 0.25, 250*time.Millisecond, nil)
+
+	// Start a request
+	tracker.Start("req1", "/api/chat", "llama2", true)
+
+	// Mark first byte
+	tracker.MarkFirstByte("req1")
+
+	// Verify TTFB data exists before finishing
+	if info := tracker.GetRequestInfo("req1"); info == nil {
+		t.Error("expected request info to exist")
+	} else if info.FirstByteTime == nil {
+		t.Error("expected FirstByteTime to be set")
+	}
+
+	// Finish the request (this moves it out of inFlight)
+	tracker.Finish("req1", StatusSuccess, nil)
+
+	// Verify TTFB data is no longer accessible (by design)
+	if info := tracker.GetRequestInfo("req1"); info != nil {
+		t.Error("expected request info to be nil after finish (moved to recent buffer)")
+	}
+
+	// But verify it was moved to recent buffer
+	snapshot := tracker.Snapshot()
+	if len(snapshot.Recent) == 0 {
+		t.Error("expected request to be in recent buffer")
+	} else {
+		req := snapshot.Recent[0]
+		if req.FirstByteTime == nil {
+			t.Error("expected FirstByteTime to be preserved in recent buffer")
+		}
+	}
+}
+
 func TestTracker_NonExistentRequest(t *testing.T) {
 	tracker := NewTracker(10, nil, nil, 0.25, 250*time.Millisecond, nil)
 

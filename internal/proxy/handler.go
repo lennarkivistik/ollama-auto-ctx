@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -24,6 +25,7 @@ import (
 	"ollama-auto-ctx/internal/storage"
 	"ollama-auto-ctx/internal/supervisor"
 	"ollama-auto-ctx/internal/util"
+	"ollama-auto-ctx/web"
 )
 
 type ctxKey string
@@ -33,6 +35,7 @@ const (
 	ctxDecisionKey   ctxKey = "decision"
 	ctxClampedKey    ctxKey = "clamped"
 	ctxRequestIDKey  ctxKey = "request_id"
+	ctxStartTimeKey  ctxKey = "start_time"
 	ctxCancelFuncKey ctxKey = "cancel_func"
 	ctxMetadataKey   ctxKey = "metadata"
 )
@@ -75,6 +78,7 @@ type Handler struct {
 	healthChecker *supervisor.HealthChecker
 	upstream      *url.URL
 	nextID        int64
+	dashboardFS   fs.FS
 }
 
 // NewHandler constructs the proxy handler.
@@ -97,6 +101,12 @@ func NewHandler(
 	rp := httputil.NewSingleHostReverseProxy(upstream)
 	rp.FlushInterval = cfg.FlushInterval
 
+	// Initialize embedded dashboard assets
+	dashboardAssets, err := web.Assets()
+	if err != nil {
+		logger.Warn("failed to load dashboard assets", "err", err)
+	}
+
 	h := &Handler{
 		cfg:           cfg,
 		features:      features,
@@ -113,6 +123,7 @@ func NewHandler(
 		retryer:       retryer,
 		metrics:       metrics,
 		healthChecker: healthChecker,
+		dashboardFS:   dashboardAssets,
 	}
 
 	rp.ModifyResponse = h.modifyResponse
@@ -122,22 +133,28 @@ func NewHandler(
 
 		if reqIDVal := r.Context().Value(ctxRequestIDKey); reqIDVal != nil {
 			if reqID, ok := reqIDVal.(string); ok {
+				// Update storage with error status and TTFB data from tracker BEFORE finishing the request
+				if h.store != nil {
+					startTimeVal := r.Context().Value(ctxStartTimeKey)
+					if startTime, ok := startTimeVal.(time.Time); ok {
+						h.finalizeStorageFromTracker(reqID, supervisor.StatusUpstreamError, "", startTime)
+					} else {
+						// Fallback to basic update if start time not available
+						now := time.Now().UnixMilli()
+						status := storage.StatusError
+						reason := storage.ReasonUpstreamError
+						h.store.Update(reqID, storage.RequestUpdate{
+							TSEnd:  &now,
+							Status: &status,
+							Reason: &reason,
+						})
+					}
+				}
 				if h.tracker != nil {
 					h.tracker.Finish(reqID, supervisor.StatusUpstreamError, err)
 				}
 				if h.watchdog != nil {
 					h.watchdog.Stop(reqID)
-				}
-				// Update storage
-				if h.store != nil {
-					now := time.Now().UnixMilli()
-					status := storage.StatusError
-					reason := storage.ReasonUpstreamError
-					h.store.Update(reqID, storage.RequestUpdate{
-						TSEnd:  &now,
-						Status: &status,
-						Reason: &reason,
-					})
 				}
 			}
 		}
@@ -154,21 +171,18 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		resp.Header.Set("X-Ollama-CtxProxy-Clamped", "true")
 	}
 
-	if !h.cfg.CalibrationEnabled {
-		return nil
-	}
-	sample, ok := resp.Request.Context().Value(ctxSampleKey).(calibration.Sample)
-	if !ok || sample.Model == "" {
-		return nil
-	}
-
-	ct := resp.Header.Get("Content-Type")
+	// Get request ID
 	reqID := ""
 	if reqIDVal := resp.Request.Context().Value(ctxRequestIDKey); reqIDVal != nil {
 		if id, ok := reqIDVal.(string); ok {
 			reqID = id
 		}
 	}
+
+	// Get sample (may be empty if not an Ollama endpoint)
+	sample, _ := resp.Request.Context().Value(ctxSampleKey).(calibration.Sample)
+
+	ct := resp.Header.Get("Content-Type")
 
 	// Loop detector for protect mode
 	var loopDetector *supervisor.LoopDetector
@@ -213,9 +227,19 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		}
 	}
 
-	resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes,
-		sample, h.calib, h.tracker, loopDetector, reqID, h.logger,
-		outputTokenLimit, outputLimitAction, cancelFunc, minOutputBytes)
+	// Always wrap response when we have tracker or storage (for telemetry)
+	// or when calibration is enabled (for calibration)
+	if h.tracker != nil || h.store != nil || h.cfg.CalibrationEnabled {
+		// Only use calibration store if calibration is enabled and we have a valid sample
+		var calibStore *calibration.Store
+		if h.cfg.CalibrationEnabled && sample.Model != "" {
+			calibStore = h.calib
+		}
+
+		resp.Body = NewTapReadCloser(resp.Body, ct, resp.ContentLength, h.cfg.ResponseTapMaxBytes,
+			sample, calibStore, h.tracker, loopDetector, reqID, h.logger,
+			outputTokenLimit, outputLimitAction, cancelFunc, minOutputBytes, h.store)
+	}
 	return nil
 }
 
@@ -243,8 +267,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dashboard (when enabled)
-	if h.features.Dashboard && r.URL.Path == "/dashboard" && r.Method == http.MethodGet {
+	// Dashboard (when enabled) - serves SPA at /dashboard and /dashboard/*
+	if h.features.Dashboard && r.Method == http.MethodGet && (r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/")) {
 		h.handleDashboard(w, r)
 		return
 	}
@@ -275,8 +299,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	startTime := time.Now()
 	if isOllamaEndpoint {
 		ctx = context.WithValue(ctx, ctxRequestIDKey, reqID)
+		ctx = context.WithValue(ctx, ctxStartTimeKey, startTime)
 	}
 
 	var alreadyFinished bool
@@ -295,6 +321,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		defer func() {
 			if !alreadyFinished && h.tracker.GetRequestInfo(reqID) != nil {
+				// Update storage with final data from tracker BEFORE finishing the request
+				// Note: TapReadCloser.Close() will also update storage with Ollama timing data
+				h.finalizeStorageFromTracker(reqID, supervisor.StatusSuccess, "", startTime)
 				h.tracker.Finish(reqID, supervisor.StatusSuccess, nil)
 			}
 		}()
@@ -539,12 +568,17 @@ func (h *Handler) rewriteRequestIfPossible(endpoint string, r *http.Request) {
 				ctxSelected := dec.ChosenCtx
 				ctxBucket := bucket
 				outBudget := dec.OutputBudgetTokens
-				h.store.Update(reqID, storage.RequestUpdate{
+				upstreamInBytes := r.ContentLength
+				upd := storage.RequestUpdate{
 					CtxEst:       &ctxEst,
 					CtxSelected:  &ctxSelected,
 					CtxBucket:    &ctxBucket,
 					OutputBudget: &outBudget,
-				})
+				}
+				if upstreamInBytes > 0 {
+					upd.UpstreamInBytes = &upstreamInBytes
+				}
+				h.store.Update(reqID, upd)
 			}
 		}
 	}
@@ -600,6 +634,90 @@ func setBody(r *http.Request, b []byte) {
 func (h *Handler) generateRequestID() string {
 	id := atomic.AddInt64(&h.nextID, 1)
 	return strconv.FormatInt(id, 10)
+}
+
+// finalizeStorageFromTracker updates the storage with final request data from tracker.
+func (h *Handler) finalizeStorageFromTracker(reqID string, status supervisor.RequestStatus, reason string, startTime time.Time) {
+	if h.store == nil || reqID == "" {
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	durationMs := int(time.Since(startTime).Milliseconds())
+
+	// Map supervisor status to storage status
+	var storageStatus storage.Status
+	var storageReason storage.Reason
+
+	switch status {
+	case supervisor.StatusSuccess:
+		storageStatus = storage.StatusSuccess
+	case supervisor.StatusCanceled:
+		storageStatus = storage.StatusCanceled
+	case supervisor.StatusTimeoutTTFB:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonTimeoutTTFB
+	case supervisor.StatusTimeoutStall:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonTimeoutStall
+	case supervisor.StatusTimeoutHard:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonTimeoutHard
+	case supervisor.StatusUpstreamError:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonUpstreamError
+	case supervisor.StatusLoopDetected:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonLoopDetected
+	case supervisor.StatusOutputLimitExceeded:
+		storageStatus = storage.StatusError
+		storageReason = storage.ReasonOutputLimitExceeded
+	default:
+		storageStatus = storage.StatusError
+	}
+
+	upd := storage.RequestUpdate{
+		TSEnd:      &now,
+		Status:     &storageStatus,
+		DurationMs: &durationMs,
+	}
+
+	if storageReason != "" {
+		upd.Reason = &storageReason
+	}
+
+	// Get additional data from tracker if available
+	if h.tracker != nil {
+		if info := h.tracker.GetRequestInfo(reqID); info != nil {
+			// Calculate TTFB from FirstByteTime
+			if info.FirstByteTime != nil {
+				ttfb := int(info.FirstByteTime.Sub(info.StartTime).Milliseconds())
+				if ttfb > 0 {
+					upd.TTFBMs = &ttfb
+				}
+			}
+			if info.PromptEvalCount > 0 {
+				pt := info.PromptEvalCount
+				upd.PromptTokens = &pt
+			}
+			if info.EvalCount > 0 {
+				ct := info.EvalCount
+				upd.CompletionTokens = &ct
+			}
+			if info.BytesForwarded > 0 {
+				bytes := info.BytesForwarded
+				upd.ClientOutBytes = &bytes
+			}
+		}
+	}
+
+	h.logger.Debug("Finalizing storage from tracker", "id", reqID,
+		"ttfb_ms", upd.TTFBMs, "client_out_bytes", upd.ClientOutBytes,
+		"prompt_tokens", upd.PromptTokens, "completion_tokens", upd.CompletionTokens)
+
+	if err := h.store.Update(reqID, upd); err != nil {
+		h.logger.Error("failed to finalize storage record", "err", err, "id", reqID)
+	}
 }
 
 func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
@@ -743,7 +861,86 @@ func (h *Handler) handleHealthzUpstream(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(dashboardHTML))
+	if h.dashboardFS == nil {
+		http.Error(w, "Dashboard assets not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Strip /dashboard prefix to get the file path
+	path := strings.TrimPrefix(r.URL.Path, "/dashboard")
+	if path == "" || path == "/" {
+		path = "/index.html"
+	}
+	path = strings.TrimPrefix(path, "/")
+
+	// Try to open the requested file
+	file, err := h.dashboardFS.Open(path)
+	if err != nil {
+		// SPA fallback: serve index.html for unknown paths (client-side routing)
+		path = "index.html"
+		file, err = h.dashboardFS.Open(path)
+		if err != nil {
+			http.Error(w, "Dashboard not found", http.StatusNotFound)
+			return
+		}
+	}
+	defer file.Close()
+
+	// Get file info for content type detection
+	stat, err := file.Stat()
+	if err != nil {
+		http.Error(w, "Failed to read dashboard", http.StatusInternalServerError)
+		return
+	}
+
+	// If it's a directory, serve index.html
+	if stat.IsDir() {
+		file.Close()
+		path = path + "/index.html"
+		file, err = h.dashboardFS.Open(path)
+		if err != nil {
+			http.Error(w, "Dashboard not found", http.StatusNotFound)
+			return
+		}
+		defer file.Close()
+		stat, _ = file.Stat()
+	}
+
+	// Set content type based on extension
+	contentType := "application/octet-stream"
+	switch {
+	case strings.HasSuffix(path, ".html"):
+		contentType = "text/html; charset=utf-8"
+	case strings.HasSuffix(path, ".css"):
+		contentType = "text/css; charset=utf-8"
+	case strings.HasSuffix(path, ".js"):
+		contentType = "application/javascript; charset=utf-8"
+	case strings.HasSuffix(path, ".json"):
+		contentType = "application/json"
+	case strings.HasSuffix(path, ".svg"):
+		contentType = "image/svg+xml"
+	case strings.HasSuffix(path, ".png"):
+		contentType = "image/png"
+	case strings.HasSuffix(path, ".ico"):
+		contentType = "image/x-icon"
+	case strings.HasSuffix(path, ".woff2"):
+		contentType = "font/woff2"
+	case strings.HasSuffix(path, ".woff"):
+		contentType = "font/woff"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+
+	// Cache static assets (but not index.html for SPA updates)
+	if !strings.HasSuffix(path, ".html") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+
+	// Serve the file
+	if seeker, ok := file.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, path, stat.ModTime(), seeker)
+	} else {
+		io.Copy(w, file)
+	}
 }

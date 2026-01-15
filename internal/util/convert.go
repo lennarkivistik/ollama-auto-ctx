@@ -47,6 +47,29 @@ func ToInt(v any) (int, bool) {
 	}
 }
 
+// ToInt64 attempts to coerce v into an int64.
+//
+// When decoding JSON into map[string]any with json.Decoder.UseNumber(),
+// numbers arrive as json.Number.
+func ToInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case float64:
+		return int64(x), true
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	default:
+		return 0, false
+	}
+}
+
 // MustJSON pretty-prints a JSON value for debugging/logging.
 func MustJSON(v any) string {
 	b, err := json.Marshal(v)

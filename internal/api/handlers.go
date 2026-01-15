@@ -105,14 +105,23 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 // RequestListItem is a summary of a request for list views.
 type RequestListItem struct {
-	ID            string  `json:"id"`
-	Timestamp     int64   `json:"ts"`
-	Model         string  `json:"model"`
-	Endpoint      string  `json:"endpoint"`
-	DurationMs    int     `json:"duration_ms"`
-	ClientOutBytes int64  `json:"bytes"`
-	Status        string  `json:"status"`
-	Reason        string  `json:"reason,omitempty"`
+	ID               string `json:"id"`
+	Timestamp        int64  `json:"ts"`
+	Model            string `json:"model"`
+	Endpoint         string `json:"endpoint"`
+	DurationMs       int    `json:"duration_ms"`
+	TTFBMs           int    `json:"ttfb_ms"`
+	CtxEst           int    `json:"ctx_est"`
+	CtxBucket        int    `json:"ctx_bucket"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	SystemChars      int    `json:"system_chars"`
+	UserChars        int    `json:"user_chars"`
+	AssistantChars   int    `json:"assistant_chars"`
+	ClientOutBytes   int64  `json:"bytes"`
+	RetryCount       int    `json:"retry_count"`
+	Status           string `json:"status"`
+	Reason           string `json:"reason,omitempty"`
 }
 
 // RequestListResponse contains paginated request list.
@@ -165,14 +174,23 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
 	items := make([]RequestListItem, len(requests))
 	for i, req := range requests {
 		items[i] = RequestListItem{
-			ID:            req.ID,
-			Timestamp:     req.TSStart,
-			Model:         req.Model,
-			Endpoint:      req.Endpoint,
-			DurationMs:    req.DurationMs,
-			ClientOutBytes: req.ClientOutBytes,
-			Status:        string(req.Status),
-			Reason:        string(req.Reason),
+			ID:               req.ID,
+			Timestamp:        req.TSStart,
+			Model:            req.Model,
+			Endpoint:         req.Endpoint,
+			DurationMs:       req.DurationMs,
+			TTFBMs:           req.TTFBMs,
+			CtxEst:           req.CtxEst,
+			CtxBucket:        req.CtxBucket,
+			PromptTokens:     req.PromptTokens,
+			CompletionTokens: req.CompletionTokens,
+			SystemChars:      req.SystemChars,
+			UserChars:        req.UserChars,
+			AssistantChars:   req.AssistantChars,
+			ClientOutBytes:   req.ClientOutBytes,
+			RetryCount:       req.RetryCount,
+			Status:           string(req.Status),
+			Reason:           string(req.Reason),
 		}
 	}
 

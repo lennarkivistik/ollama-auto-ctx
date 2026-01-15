@@ -48,6 +48,7 @@ func TestTapReadCloser_OutputLimit_Cancel(t *testing.T) {
 		"cancel",
 		cancelFunc,
 		minOutputBytes,
+		nil, // no data store for this test
 	).(*TapReadCloser)
 
 	// Read data - should trigger limit after minimum threshold
@@ -126,6 +127,7 @@ func TestTapReadCloser_OutputLimit_Warn(t *testing.T) {
 		"warn", // Warn only, don't cancel
 		cancelFunc,
 		minOutputBytes,
+		nil, // no data store for this test
 	).(*TapReadCloser)
 
 	// Read all data - should warn but not cancel
@@ -179,6 +181,7 @@ func TestTapReadCloser_OutputLimit_Disabled(t *testing.T) {
 		"cancel",
 		nil,
 		256,
+		nil, // no data store for this test
 	).(*TapReadCloser)
 
 	// Read all data - should not trigger limit
@@ -230,6 +233,7 @@ func TestTapReadCloser_OutputLimit_BelowMinimum(t *testing.T) {
 		"cancel",
 		cancelFunc,
 		minOutputBytes,
+		nil, // no data store for this test
 	).(*TapReadCloser)
 
 	// Read all data

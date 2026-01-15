@@ -8,12 +8,34 @@ set -e
 if [ $# -ne 3 ]; then
     echo "Usage: $0 <GOOS> <GOARCH> <VERSION>"
     echo "Example: $0 linux amd64 v1.0.0"
+    echo "Example: $0 darwin arm64 v1.0.0"
+    echo "Available architectures: amd64, arm64, arm, mips64, mips64le, mips, mipsle, ppc64, ppc64le, s390x, riscv64"
+    echo "Available operating systems: linux, darwin, windows"
     exit 1
 fi
 
 GOOS=$1
 GOARCH=$2
 VERSION=$3
+
+# Build frontend dashboard
+echo "Building frontend dashboard..."
+if command -v bun &> /dev/null; then
+    (cd frontend && bun install && bun run build)
+elif command -v npm &> /dev/null; then
+    (cd frontend && npm ci && npm run build)
+else
+    echo "Warning: Neither bun nor npm found, skipping frontend build"
+fi
+
+# Copy frontend build to web/dist for embedding
+if [ -d "frontend/dist" ]; then
+    echo "Copying frontend assets to web/dist..."
+    rm -rf web/dist
+    cp -r frontend/dist web/dist
+else
+    echo "Warning: frontend/dist not found, using placeholder"
+fi
 
 # Determine if the target is Windows for executable extension
 OUTPUT_NAME="ollama-auto-ctx-${GOOS}-${GOARCH}-${VERSION}"

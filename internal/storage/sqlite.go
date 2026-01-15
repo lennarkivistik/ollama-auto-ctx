@@ -1,4 +1,4 @@
-//go:build cgo && !mips64 && !mips64le && !ppc64 && !s390x
+//go:build !mips64 && !mips64le && !ppc64 && !s390x
 
 package storage
 
@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite" // CGO-based SQLite driver
+	_ "modernc.org/sqlite" // Pure Go SQLite driver (no CGO required)
 )
 
 const schema = `

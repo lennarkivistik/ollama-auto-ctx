@@ -8,12 +8,13 @@ import (
 	"strings"
 
 	"ollama-auto-ctx/internal/calibration"
+	"ollama-auto-ctx/internal/storage"
 	"ollama-auto-ctx/internal/supervisor"
 	"ollama-auto-ctx/internal/util"
 )
 
 // TapReadCloser wraps an upstream response body and "taps" the bytes
-// to extract Ollama's prompt_eval_count for auto-calibration.
+// to extract Ollama's prompt_eval_count for auto-calibration and timing data.
 //
 // This wrapper is designed to be:
 // - streaming safe (it does not buffer full NDJSON streams)
@@ -30,7 +31,8 @@ type TapReadCloser struct {
 	maxBuffer int64
 
 	sample       calibration.Sample
-	store        *calibration.Store
+	calibStore   *calibration.Store
+	dataStore    storage.Store
 	tracker      *supervisor.Tracker
 	loopDetector *supervisor.LoopDetector
 	requestID    string
@@ -53,10 +55,18 @@ type TapReadCloser struct {
 	observed      bool
 	firstByteSent bool
 	totalBytes    int64 // total bytes read for limit checking
+
+	// Parsed Ollama response data
+	promptEvalCount      int
+	evalCount            int
+	loadDurationNs       int64
+	promptEvalDurationNs int64
+	evalDurationNs       int64
+	totalDurationNs      int64
 }
 
 // NewTapReadCloser wraps rc and returns a ReadCloser that updates the calibration store.
-func NewTapReadCloser(rc io.ReadCloser, contentType string, _ int64, maxBuffer int64, sample calibration.Sample, store *calibration.Store, tracker *supervisor.Tracker, loopDetector *supervisor.LoopDetector, requestID string, logger *slog.Logger, outputTokenLimit int64, outputLimitAction string, cancelFunc func(), minOutputBytes int64) io.ReadCloser {
+func NewTapReadCloser(rc io.ReadCloser, contentType string, _ int64, maxBuffer int64, sample calibration.Sample, calibStore *calibration.Store, tracker *supervisor.Tracker, loopDetector *supervisor.LoopDetector, requestID string, logger *slog.Logger, outputTokenLimit int64, outputLimitAction string, cancelFunc func(), minOutputBytes int64, dataStore storage.Store) io.ReadCloser {
 	ctLower := strings.ToLower(contentType)
 	isNDJSON := strings.Contains(ctLower, "application/x-ndjson")
 	isJSON := strings.Contains(ctLower, "application/json")
@@ -64,18 +74,19 @@ func NewTapReadCloser(rc io.ReadCloser, contentType string, _ int64, maxBuffer i
 	return &TapReadCloser{
 		rc:                rc,
 		isNDJSON:          isNDJSON,
-		isJSON:             isJSON,
-		maxBuffer:          maxBuffer,
-		sample:             sample,
-		store:              store,
-		tracker:            tracker,
-		loopDetector:       loopDetector,
-		requestID:          requestID,
-		logger:             logger,
-		outputTokenLimit:   outputTokenLimit,
-		outputLimitAction:  outputLimitAction,
-		cancelFunc:         cancelFunc,
-		minOutputBytes:     minOutputBytes,
+		isJSON:            isJSON,
+		maxBuffer:         maxBuffer,
+		sample:            sample,
+		calibStore:        calibStore,
+		dataStore:         dataStore,
+		tracker:           tracker,
+		loopDetector:      loopDetector,
+		requestID:         requestID,
+		logger:            logger,
+		outputTokenLimit:  outputTokenLimit,
+		outputLimitAction: outputLimitAction,
+		cancelFunc:        cancelFunc,
+		minOutputBytes:    minOutputBytes,
 	}
 }
 
@@ -126,15 +137,14 @@ func (t *TapReadCloser) Read(p []byte) (int, error) {
 			}
 		}
 
-		if !t.observed {
-			t.process(p[:n])
-		}
+		// Always process chunks to capture timing data, not just for calibration
+		t.process(p[:n])
 	}
 	if err == io.EOF {
-		// Best-effort parse of any trailing bytes.
-		if !t.observed {
-			t.finish()
-		}
+		// Best-effort parse of any trailing bytes
+		t.finish()
+		// Update storage with parsed data
+		t.updateStorage()
 	}
 	return n, err
 }
@@ -178,6 +188,14 @@ func (t *TapReadCloser) feedLoopDetector(line []byte) bool {
 }
 
 func (t *TapReadCloser) Close() error {
+	// Ensure we parse any remaining data and update storage
+	t.finish()
+	t.updateStorage()
+	if t.logger != nil && t.requestID != "" {
+		t.logger.Debug("TapReadCloser closed, storage updated", "id", t.requestID,
+			"prompt_tokens", t.promptEvalCount, "completion_tokens", t.evalCount,
+			"load_ms", t.loadDurationNs/1_000_000, "eval_ms", t.evalDurationNs/1_000_000)
+	}
 	return t.rc.Close()
 }
 
@@ -205,10 +223,8 @@ func (t *TapReadCloser) process(chunk []byte) {
 			// Loop detector will cancel the request if loop is detected
 			t.feedLoopDetector(line)
 
+			// Always parse to get timing data, not just for calibration
 			t.tryParseJSON(line)
-			if t.observed {
-				return
-			}
 		}
 	}
 
@@ -232,9 +248,7 @@ func (t *TapReadCloser) process(chunk []byte) {
 }
 
 func (t *TapReadCloser) finish() {
-	if t.observed {
-		return
-	}
+	// Parse any remaining data regardless of observation status
 	if t.isNDJSON {
 		// Try parsing any trailing partial line.
 		line := bytes.TrimSpace(bytes.TrimSuffix(t.ndjsonBuf, []byte{'\r'}))
@@ -259,11 +273,12 @@ func (t *TapReadCloser) tryParseJSON(line []byte) {
 	}
 
 	// Extract prompt_eval_count (input tokens)
-	var promptEvalCount int
 	if v, ok := m["prompt_eval_count"]; ok {
 		if n, ok := util.ToInt(v); ok && n > 0 {
-			promptEvalCount = n
-			t.store.Update(t.sample, calibration.Observed{PromptEvalCount: n})
+			t.promptEvalCount = n
+			if t.calibStore != nil && t.sample.Model != "" {
+				t.calibStore.Update(t.sample, calibration.Observed{PromptEvalCount: n})
+			}
 			t.observed = true
 			if t.logger != nil {
 				t.logger.Debug("calibration observation", "model", t.sample.Model, "prompt_eval_count", n)
@@ -272,16 +287,88 @@ func (t *TapReadCloser) tryParseJSON(line []byte) {
 	}
 
 	// Extract eval_count (output tokens)
-	var evalCount int
 	if v, ok := m["eval_count"]; ok {
 		if n, ok := util.ToInt(v); ok && n > 0 {
-			evalCount = n
+			t.evalCount = n
+		}
+	}
+
+	// Extract timing data from Ollama response (in nanoseconds)
+	if v, ok := m["total_duration"]; ok {
+		if n, ok := util.ToInt64(v); ok && n > 0 {
+			t.totalDurationNs = n
+		}
+	}
+	if v, ok := m["load_duration"]; ok {
+		if n, ok := util.ToInt64(v); ok && n > 0 {
+			t.loadDurationNs = n
+		}
+	}
+	if v, ok := m["prompt_eval_duration"]; ok {
+		if n, ok := util.ToInt64(v); ok && n > 0 {
+			t.promptEvalDurationNs = n
+		}
+	}
+	if v, ok := m["eval_duration"]; ok {
+		if n, ok := util.ToInt64(v); ok && n > 0 {
+			t.evalDurationNs = n
 		}
 	}
 
 	// Update tracker with token counts if available
-	if (promptEvalCount > 0 || evalCount > 0) && t.tracker != nil && t.requestID != "" {
-		t.tracker.UpdateTokenCounts(t.requestID, promptEvalCount, evalCount)
+	if (t.promptEvalCount > 0 || t.evalCount > 0) && t.tracker != nil && t.requestID != "" {
+		t.tracker.UpdateTokenCounts(t.requestID, t.promptEvalCount, t.evalCount)
+	}
+}
+
+// updateStorage updates the storage with parsed Ollama response data.
+func (t *TapReadCloser) updateStorage() {
+	if t.dataStore == nil || t.requestID == "" {
+		return
+	}
+
+	upd := storage.RequestUpdate{}
+	hasUpdate := false
+
+	// Token counts
+	if t.promptEvalCount > 0 {
+		upd.PromptTokens = &t.promptEvalCount
+		hasUpdate = true
+	}
+	if t.evalCount > 0 {
+		upd.CompletionTokens = &t.evalCount
+		hasUpdate = true
+	}
+
+	// Timing data (convert nanoseconds to milliseconds)
+	if t.loadDurationNs > 0 {
+		loadMs := int(t.loadDurationNs / 1_000_000)
+		upd.UpstreamLoadMs = &loadMs
+		hasUpdate = true
+	}
+	if t.promptEvalDurationNs > 0 {
+		promptEvalMs := int(t.promptEvalDurationNs / 1_000_000)
+		upd.UpstreamPromptEvalMs = &promptEvalMs
+		hasUpdate = true
+	}
+	if t.evalDurationNs > 0 {
+		evalMs := int(t.evalDurationNs / 1_000_000)
+		upd.UpstreamEvalMs = &evalMs
+		hasUpdate = true
+	}
+
+	// Bytes transferred (upstream out = bytes we received from upstream)
+	if t.totalBytes > 0 {
+		upd.UpstreamOutBytes = &t.totalBytes
+		hasUpdate = true
+	}
+
+	if hasUpdate {
+		if err := t.dataStore.Update(t.requestID, upd); err != nil {
+			if t.logger != nil {
+				t.logger.Error("failed to update storage from tap", "err", err, "id", t.requestID)
+			}
+		}
 	}
 }
 
@@ -289,11 +376,11 @@ func (t *TapReadCloser) tryParseJSON(line []byte) {
 func (t *TapReadCloser) estimateOutputTokens() int64 {
 	// Use calibration store if available, otherwise use default
 	defaultTokensPerByte := 0.25
-	if t.store != nil {
-		params := t.store.Get(t.sample.Model)
+	if t.calibStore != nil {
+		params := t.calibStore.Get(t.sample.Model)
 		if params.TokensPerByte > 0 {
 			defaultTokensPerByte = params.TokensPerByte
 		}
 	}
-	return supervisor.EstimateOutputTokens(t.totalBytes, t.sample.Model, t.store, defaultTokensPerByte)
+	return supervisor.EstimateOutputTokens(t.totalBytes, t.sample.Model, t.calibStore, defaultTokensPerByte)
 }
