@@ -23,7 +23,13 @@ jobs:
         with:
           go-version: '1.22' # Match go.mod requirement
 
-      # Step 2.5: Make build script executable
+      # Step 2.5: Install bun
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Step 2.6: Make build script executable
       - name: Make build script executable
         run: chmod +x build.sh
 
